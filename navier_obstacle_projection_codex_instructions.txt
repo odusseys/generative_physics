@@ -1,0 +1,478 @@
+Yes. The masked Jacobi projection made the solver much more expensive.
+
+Your original projection cost was roughly:
+
+[
+O(N \log N)
+]
+
+per time step from FFT.
+
+The masked obstacle projection I suggested with Jacobi is roughly:
+
+[
+O(kN)
+]
+
+per time step, where (k) is `masked_pressure_iterations`, currently around `300`. For a 256² grid and about 1000 simulation steps/video, that is approximately:
+
+[
+300 \times 1000 = 300{,}000
+]
+
+full-grid stencil sweeps per sample. That will be extremely slow.
+
+The best practical fix is: **replace masked Jacobi with matrix-free preconditioned conjugate gradient and use a residual tolerance**, not a fixed 300 Jacobi sweeps. For dataset/video generation, use something like:
+
+```python
+masked_pressure_max_iterations = 80
+masked_pressure_tolerance = 1e-4
+```
+
+and for the initial projection only, optionally use:
+
+```python
+initial_projection_max_iterations = 150
+initial_projection_tolerance = 1e-5
+```
+
+Also precompute the mask geometry once per simulation: `open_x`, `open_y`, `denom`, `inv_diag`, `fluid_float`, `fluid_count`. Do not recompute these inside every Poisson iteration.
+
+Use this instruction for Codex:
+
+````text
+The previous obstacle-aware masked Jacobi projection made the simulation too slow. Replace the fixed-iteration masked Jacobi pressure projection with a matrix-free preconditioned conjugate-gradient solver with early stopping, and precompute all mask geometry once per simulation.
+
+Keep the existing spectral FFT projection for obstacle-free simulations. Only change the obstacle path.
+
+Required changes:
+
+1. Do not use hundreds of Jacobi iterations per timestep.
+
+The current masked projection likely does something equivalent to:
+
+```python
+for _ in range(masked_pressure_iterations):
+    ...
+````
+
+inside `_masked_poisson_jacobi`. This is too slow at 256x256 because it runs every CFD timestep.
+
+Replace `_masked_poisson_jacobi` with a matrix-free PCG solver for the same masked Neumann Poisson problem.
+
+2. Precompute masked Poisson geometry once per obstacle.
+
+Add a helper:
+
+```python
+def _masked_poisson_geometry(fluid_mask, dx, dy):
+    ...
+```
+
+It should return a dict containing:
+
+```python
+fluid_mask
+fluid_float
+fluid_count
+open_e
+open_w
+open_s
+open_n
+denom
+inv_diag
+dx
+dy
+```
+
+Use:
+
+```python
+fluid_float = fluid_mask.to(dtype=torch.float32 or current dtype)
+fluid_count = fluid_float.sum().clamp_min(1.0)
+```
+
+Construct open faces:
+
+```python
+open_e = torch.zeros_like(fluid_mask)
+open_w = torch.zeros_like(fluid_mask)
+open_s = torch.zeros_like(fluid_mask)
+open_n = torch.zeros_like(fluid_mask)
+
+open_x = fluid_mask[:, :-1] & fluid_mask[:, 1:]
+open_y = fluid_mask[:-1, :] & fluid_mask[1:, :]
+
+open_e[:, :-1] = open_x
+open_w[:, 1:] = open_x
+open_s[:-1, :] = open_y
+open_n[1:, :] = open_y
+```
+
+Then:
+
+```python
+dx2 = dx * dx
+dy2 = dy * dy
+
+denom = (
+    open_e.to(dtype) / dx2
+    + open_w.to(dtype) / dx2
+    + open_s.to(dtype) / dy2
+    + open_n.to(dtype) / dy2
+)
+
+inv_diag = torch.where(
+    denom > 0,
+    1.0 / denom,
+    torch.zeros_like(denom),
+)
+```
+
+Do not use boolean advanced indexing inside the iterative solver. Use masks as float tensors and slicing.
+
+3. Add a zero-mean helper for the Neumann nullspace.
+
+Add:
+
+```python
+def _zero_mean_fluid(field, geometry):
+    fluid = geometry["fluid_float"]
+    count = geometry["fluid_count"]
+    field = field * fluid
+    return field - fluid * (field.sum() / count)
+```
+
+This removes the constant-pressure nullspace and keeps solid cells zero.
+
+4. Add a matrix-free positive Laplacian.
+
+The projection equation is:
+
+```python
+lap(phi) = rhs
+```
+
+where `rhs` is the finite-volume divergence.
+
+For PCG, solve the positive semidefinite system:
+
+```python
+A phi = b
+A = -lap
+b = -rhs
+```
+
+Implement:
+
+```python
+def _masked_positive_laplacian(phi, geometry):
+    dx = geometry["dx"]
+    dy = geometry["dy"]
+    dx2 = dx * dx
+    dy2 = dy * dy
+
+    open_e = geometry["open_e"].to(dtype=phi.dtype)
+    open_w = geometry["open_w"].to(dtype=phi.dtype)
+    open_s = geometry["open_s"].to(dtype=phi.dtype)
+    open_n = geometry["open_n"].to(dtype=phi.dtype)
+    denom = geometry["denom"].to(dtype=phi.dtype)
+    fluid = geometry["fluid_float"].to(dtype=phi.dtype)
+
+    neighbor_sum = torch.zeros_like(phi)
+
+    neighbor_sum[:, :-1] += open_e[:, :-1] * phi[:, 1:] / dx2
+    neighbor_sum[:, 1:] += open_w[:, 1:] * phi[:, :-1] / dx2
+    neighbor_sum[:-1, :] += open_s[:-1, :] * phi[1:, :] / dy2
+    neighbor_sum[1:, :] += open_n[1:, :] * phi[:-1, :] / dy2
+
+    out = denom * phi - neighbor_sum
+    out = out * fluid
+    out = _zero_mean_fluid(out, geometry)
+    return out
+```
+
+This operator should correspond to homogeneous Neumann on solid boundaries and no pressure coupling through obstacle faces.
+
+5. Implement PCG.
+
+Add:
+
+```python
+def _masked_poisson_pcg(
+    rhs,
+    geometry,
+    max_iterations=80,
+    tolerance=1e-4,
+    initial_phi=None,
+):
+    ...
+```
+
+Implementation requirements:
+
+* Convert `rhs` to zero-mean over fluid cells.
+* Solve `A phi = b`, where `b = -rhs`.
+* Use `_masked_positive_laplacian`.
+* Use Jacobi preconditioning with `inv_diag`.
+* Warm-start from `initial_phi` when provided.
+* Stop when:
+
+```python
+sqrt(sum(r * r)) <= tolerance * sqrt(sum(b * b))
+```
+
+* Always return a zero-mean fluid-only `phi`.
+
+Skeleton:
+
+```python
+def _masked_poisson_pcg(rhs, geometry, max_iterations=80, tolerance=1e-4, initial_phi=None):
+    fluid = geometry["fluid_float"].to(dtype=rhs.dtype)
+    inv_diag = geometry["inv_diag"].to(dtype=rhs.dtype)
+
+    rhs = _zero_mean_fluid(rhs, geometry)
+    b = _zero_mean_fluid(-rhs, geometry)
+
+    if initial_phi is None:
+        x = torch.zeros_like(rhs)
+    else:
+        x = _zero_mean_fluid(initial_phi.to(device=rhs.device, dtype=rhs.dtype), geometry)
+
+    r = _zero_mean_fluid(b - _masked_positive_laplacian(x, geometry), geometry)
+    z = _zero_mean_fluid(inv_diag * r, geometry)
+    p = z.clone()
+
+    rz_old = (r * z).sum()
+    b_norm = torch.sqrt((b * b).sum()).clamp_min(1e-20)
+
+    if torch.sqrt((r * r).sum()) <= float(tolerance) * b_norm:
+        return x
+
+    for _ in range(int(max_iterations)):
+        Ap = _masked_positive_laplacian(p, geometry)
+        denom = (p * Ap).sum().clamp_min(1e-20)
+        alpha = rz_old / denom
+
+        x = _zero_mean_fluid(x + alpha * p, geometry)
+        r = _zero_mean_fluid(r - alpha * Ap, geometry)
+
+        if torch.sqrt((r * r).sum()) <= float(tolerance) * b_norm:
+            break
+
+        z = _zero_mean_fluid(inv_diag * r, geometry)
+        rz_new = (r * z).sum()
+        beta = rz_new / rz_old.clamp_min(1e-20)
+        p = _zero_mean_fluid(z + beta * p, geometry)
+        rz_old = rz_new
+
+    return _zero_mean_fluid(x, geometry)
+```
+
+6. Update `_project_velocity_masked_fv`.
+
+Change its signature to accept geometry and PCG controls:
+
+```python
+def _project_velocity_masked_fv(
+    provisional,
+    rho,
+    delta_t,
+    dx,
+    dy,
+    obstacle_mask,
+    pressure_max_iterations,
+    pressure_tolerance,
+    pressure=None,
+    geometry=None,
+    boundary_u=1.0,
+    boundary_v=0.0,
+):
+    ...
+```
+
+Inside:
+
+```python
+fluid_mask = ~obstacle_mask
+if geometry is None:
+    geometry = _masked_poisson_geometry(fluid_mask, dx, dy)
+```
+
+Compute face divergence exactly as before.
+
+Before solving:
+
+```python
+rhs = div.clone()
+rhs = _zero_mean_fluid(rhs, geometry)
+```
+
+Warm-start PCG from the previous pressure:
+
+```python
+initial_phi = None
+if pressure is not None:
+    initial_phi = pressure * (delta_t / rho)
+```
+
+Then:
+
+```python
+phi = _masked_poisson_pcg(
+    rhs,
+    geometry,
+    max_iterations=pressure_max_iterations,
+    tolerance=pressure_tolerance,
+    initial_phi=initial_phi,
+)
+```
+
+Correct face fluxes exactly as before:
+
+```python
+u_face_new[:, 1:-1][open_x] -= (phi[:, 1:] - phi[:, :-1])[open_x] / dx
+v_face_new[1:-1, :][open_y] -= (phi[1:, :] - phi[:-1, :])[open_y] / dy
+```
+
+Then reconstruct cell-centered velocity and return:
+
+```python
+pressure = rho / delta_t * phi
+return next_velocity, pressure
+```
+
+7. Precompute geometry once inside `simulate_navier_stokes`.
+
+After validating `obstacle_mask`, add:
+
+```python
+masked_poisson_geometry = None
+if obstacle_mask is not None:
+    masked_poisson_geometry = _masked_poisson_geometry(~obstacle_mask, dx, dy)
+```
+
+Pass `masked_poisson_geometry` into every call to `_project_velocity_masked_fv`.
+
+Do not rebuild geometry every timestep.
+
+8. Add separate controls for initial projection and per-step projection.
+
+Add arguments to `simulate_navier_stokes` and `generate_navier_dataset`:
+
+```python
+masked_pressure_max_iterations: int = 80
+masked_pressure_tolerance: float = 1e-4
+initial_masked_pressure_max_iterations: int = 150
+initial_masked_pressure_tolerance: float = 1e-5
+```
+
+Use the initial values only for `project_initial=True`.
+
+Use the per-step values during simulation.
+
+Add CLI args:
+
+```python
+parser.add_argument("--masked-pressure-max-iterations", type=int, default=80)
+parser.add_argument("--masked-pressure-tolerance", type=float, default=1e-4)
+parser.add_argument("--initial-masked-pressure-max-iterations", type=int, default=150)
+parser.add_argument("--initial-masked-pressure-tolerance", type=float, default=1e-5)
+```
+
+Keep backwards compatibility with any existing `masked_pressure_iterations` argument if it was already added, but stop using a hardcoded default of 300 per step.
+
+9. Make the default fast enough for dataset generation.
+
+Use these defaults:
+
+```python
+masked_pressure_max_iterations = 80
+masked_pressure_tolerance = 1e-4
+initial_masked_pressure_max_iterations = 150
+initial_masked_pressure_tolerance = 1e-5
+```
+
+Do not use 300 fixed Jacobi iterations per simulation step.
+
+10. Optional but recommended: add a very fast visual mode using Brinkman penalization.
+
+Add a solver mode:
+
+```python
+obstacle_method: str = "masked_pcg"
+```
+
+Supported values:
+
+```python
+"masked_pcg"
+"penalized_spectral"
+```
+
+For `"penalized_spectral"`, do not hard-clamp the obstacle after spectral projection. Instead, add Brinkman damping inside the obstacle before projection:
+
+```python
+chi = obstacle_mask.to(dtype=velocity.dtype)
+damping = torch.exp(-delta_t / eta)
+provisional[:, obstacle_mask] *= damping
+```
+
+Then use the existing FFT projection. Render obstacle cells black in videos, but avoid clamping after projection.
+
+Use default:
+
+```python
+obstacle_method="masked_pcg"
+```
+
+but allow dataset generation to use:
+
+```bash
+--obstacle-method penalized_spectral
+```
+
+for much faster approximate visual data.
+
+11. Update diagnostics.
+
+Keep `masked_divergence`, but ensure it reuses the precomputed finite-volume geometry where possible.
+
+Report PCG iteration counts if convenient:
+
+```python
+initial_projection_iterations
+average_projection_iterations
+max_projection_iterations
+```
+
+This can be done by returning `(phi, iterations, residual)` from `_masked_poisson_pcg`, or skipped if it complicates the patch.
+
+12. Expected result.
+
+After this edit:
+
+* Obstacle simulations should no longer use slow fixed 300-iteration Jacobi every timestep.
+* The first frame should still be projected and obstacle-compatible.
+* Per-step projection should use PCG with early stopping and pressure warm-start.
+* Runtime should drop substantially.
+* For maximum speed, `obstacle_method="penalized_spectral"` should run close to the original FFT-based speed, at the cost of approximate obstacle physics.
+
+````
+
+For immediate relief without editing much: lower the per-step masked iterations aggressively. For visual dataset generation, try:
+
+```bash
+--masked-pressure-iterations 40
+````
+
+or, if you added the newer controls:
+
+```bash
+--masked-pressure-max-iterations 50 \
+--masked-pressure-tolerance 1e-3 \
+--initial-masked-pressure-max-iterations 120 \
+--initial-masked-pressure-tolerance 1e-5
+```
+
+The initial projection is the one that prevents the huge first-frame jump; the per-step projection does not need to be solved to high precision for every video frame.
