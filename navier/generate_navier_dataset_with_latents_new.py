@@ -24,16 +24,20 @@ from torchvision.io import read_video, read_video_timestamps, write_video
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = Path("/home/azureuser/datasets/navier_fast")
+DEFAULT_WITH_VORTICITY_OUTPUT_ROOT = Path(
+    "/home/azureuser/datasets/navier_with_vorticity"
+)
 DEFAULT_WAN_REPO_ROOT = REPO_ROOT / "navier" / "Wan2.2"
 DEFAULT_WAN_CHECKPOINT_DIR = Path("/home/azureuser/Wan2.2-TI2V-5B")
 
 NAVIER_GRID_SIZE = 256
-DEFAULT_VIDEO_WIDTH = 480
-DEFAULT_VIDEO_HEIGHT = 240
+DEFAULT_VIDEO_WIDTH = 256
+DEFAULT_VIDEO_HEIGHT = 128
 DEFAULT_SAMPLE_COUNT = 2000
 DEFAULT_BATCH_SIZE = 2
 DEFAULT_DURATION_SECONDS = 2.5
 DEFAULT_FPS = 64
+DEFAULT_STACK_VORTICITY = True
 DEFAULT_WIND_SPEED = 2.0
 DEFAULT_MAX_DELTA_T = 5e-3
 DEFAULT_OBSTACLE_METHOD = "penalized_spectral"
@@ -60,7 +64,10 @@ WAN_REPO_ROOT = DEFAULT_WAN_REPO_ROOT
 WAN_CHECKPOINT_DIR = DEFAULT_WAN_CHECKPOINT_DIR
 WAN_TI2V_5B_VAE_CHECKPOINT = "Wan2.2_VAE.pth"
 WAN_TI2V_5B_VAE_STRIDE = (4, 16, 16)
-DEFAULT_WAN_EXPECTED_SIZE = (DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH)
+DEFAULT_WAN_EXPECTED_SIZE = (
+    DEFAULT_VIDEO_HEIGHT * (2 if DEFAULT_STACK_VORTICITY else 1),
+    DEFAULT_VIDEO_WIDTH,
+)
 
 
 def _navier_grid_size(n: Optional[int] = None) -> int:
@@ -2501,6 +2508,40 @@ def _simulation_to_uint8_video_frames(
     return (frames, frame_indices.detach().cpu())
 
 
+def _simulation_to_stacked_uint8_video_frames(
+    simulation: Dict[str, torch.Tensor],
+    field: str = "speed",
+    output_size: Optional[int | Tuple[int, int]] = None,
+    max_frames: Optional[int] = None,
+    velocity_color_bound: Optional[float] = 1.0,
+    prepend_initial_condition: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Render flow over vorticity as one vertically stacked RGB video."""
+    flow_frames, frame_indices = _simulation_to_uint8_video_frames(
+        simulation,
+        field=field,
+        output_size=output_size,
+        max_frames=max_frames,
+        velocity_color_bound=velocity_color_bound,
+        prepend_initial_condition=prepend_initial_condition,
+    )
+    vorticity_frames, vorticity_indices = _simulation_to_uint8_video_frames(
+        simulation,
+        field="vorticity",
+        output_size=output_size,
+        max_frames=max_frames,
+        velocity_color_bound=velocity_color_bound,
+        prepend_initial_condition=prepend_initial_condition,
+    )
+    if not torch.equal(frame_indices, vorticity_indices):
+        raise RuntimeError("flow and vorticity videos sampled different frame indices")
+    if flow_frames.shape != vorticity_frames.shape:
+        raise RuntimeError(
+            "flow and vorticity videos must have the same shape before stacking"
+        )
+    return (torch.cat((flow_frames, vorticity_frames), dim=1), frame_indices)
+
+
 def _make_random_sample_dir(root: Path, uid_bytes: int = 8) -> Tuple[str, Path]:
     for _ in range(1000):
         uid = secrets.token_hex(uid_bytes)
@@ -2515,7 +2556,7 @@ def _make_random_sample_dir(root: Path, uid_bytes: int = 8) -> Tuple[str, Path]:
 
 def generate_navier_dataset(
     N: int,
-    output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    output_root: Optional[str | Path] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     n: Optional[int] = None,
     video_width: int = DEFAULT_VIDEO_WIDTH,
@@ -2529,6 +2570,7 @@ def generate_navier_dataset(
     save_every: int = 10,
     max_video_frames: Optional[int] = None,
     field: str = "speed",
+    stack_vorticity: bool = DEFAULT_STACK_VORTICITY,
     delta_t: Optional[float] = None,
     pressure_method: str = "spectral",
     pressure_iterations: int = 80,
@@ -2550,6 +2592,7 @@ def generate_navier_dataset(
     dtype: torch.dtype = torch.float32,
     video_codec: str = "libx264",
     video_options: Optional[Dict[str, str]] = None,
+    verify_written_videos: bool = False,
     velocity_color_bound: Optional[float] = None,
     initial_projection_steps: int = 0,
     initial_projection_delta_t: float = 1.0,
@@ -2566,7 +2609,7 @@ def generate_navier_dataset(
     continue_on_latent_error: bool = True,
     latent_records: Optional[list[Dict]] = None,
 ) -> list[Dict[str, str | float | int | bool]]:
-    """Generate N samples with flow videos and metadata."""
+    """Generate N samples with flow videos, optional vorticity stacks, and metadata."""
     if N < 1:
         raise ValueError("N must be positive")
     batch_size = int(batch_size)
@@ -2609,6 +2652,12 @@ def generate_navier_dataset(
             "plus an optional prepended initial-condition frame."
         )
 
+    if output_root is None:
+        output_root = (
+            DEFAULT_WITH_VORTICITY_OUTPUT_ROOT
+            if stack_vorticity
+            else DEFAULT_OUTPUT_ROOT
+        )
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
     device = (
@@ -2771,19 +2820,33 @@ def generate_navier_dataset(
                         "simulation first frame violates obstacle no-slip mask"
                     )
 
-                frames, _ = _simulation_to_uint8_video_frames(
-                    simulation,
-                    field=field,
-                    output_size=video_hw,
-                    velocity_color_bound=velocity_color_bound,
-                    prepend_initial_condition=prepend_initial_condition,
+                video_label = (
+                    "flow/vorticity stacked video"
+                    if stack_vorticity
+                    else "flow video"
                 )
+                if stack_vorticity:
+                    frames, _ = _simulation_to_stacked_uint8_video_frames(
+                        simulation,
+                        field=field,
+                        output_size=video_hw,
+                        velocity_color_bound=velocity_color_bound,
+                        prepend_initial_condition=prepend_initial_condition,
+                    )
+                else:
+                    frames, _ = _simulation_to_uint8_video_frames(
+                        simulation,
+                        field=field,
+                        output_size=video_hw,
+                        velocity_color_bound=velocity_color_bound,
+                        prepend_initial_condition=prepend_initial_condition,
+                    )
                 video_timing = _verify_realtime_video_tensor(
                     frames,
                     float(T),
                     int(fps),
                     expected_frame_count=video_frame_count,
-                    label="flow video",
+                    label=video_label,
                 )
 
                 sample_dir = spec["sample_dir"]
@@ -2795,18 +2858,33 @@ def generate_navier_dataset(
                     video_codec=video_codec,
                     options=video_options,
                 )
-                video_timing = _verify_written_video_timing(
-                    video_path,
-                    float(T),
-                    int(fps),
-                    expected_frame_count=video_frame_count,
-                    label="flow video",
-                )
+                if verify_written_videos:
+                    video_timing = _verify_written_video_timing(
+                        video_path,
+                        float(T),
+                        int(fps),
+                        expected_frame_count=video_frame_count,
+                        label=video_label,
+                    )
+                    video_timing["timing_verification_scope"] = "written_video"
+                    video_timing["written_video_timing_verified"] = bool(
+                        video_timing["timing_verified"]
+                    )
+                else:
+                    video_timing = dict(video_timing)
+                    video_timing.update(
+                        {
+                            "timing_verified": True,
+                            "timing_verification_scope": "rendered_tensor",
+                            "written_video_timing_verified": False,
+                        }
+                    )
 
                 latent_record = None
                 if encode_latents:
                     try:
-                        latent_record = encode_video_to_wan_latents(
+                        latent_record = encode_frames_to_wan_latents(
+                            frames,
                             video_path,
                             vae=vae,
                             checkpoint_dir=wan_checkpoint_dir,
@@ -2815,7 +2893,7 @@ def generate_navier_dataset(
                             vae_dtype=vae_dtype,
                             save_dtype=latent_save_dtype,
                             overwrite=overwrite_latents,
-                            expected_size=(video_height, video_width),
+                            expected_size=(int(frames.shape[1]), int(frames.shape[2])),
                             resize=resize_latents,
                         )
                     except Exception as exc:
@@ -2827,12 +2905,24 @@ def generate_navier_dataset(
                             "error": repr(exc),
                         }
                     latent_record["kind"] = "video"
+                    latent_record["video_layout"] = (
+                        "flow_over_vorticity" if stack_vorticity else "single"
+                    )
                     latent_record["uid"] = spec["uid"]
                     latent_records.append(latent_record)
 
                 metadata = {
                     "nu": spec["nu"],
                     "rho": spec["rho"],
+                    "field": field,
+                    "stack_vorticity": bool(stack_vorticity),
+                    "video_layout": (
+                        "flow_over_vorticity" if stack_vorticity else "single"
+                    ),
+                    "panel_height": int(video_height),
+                    "panel_width": int(video_width),
+                    "video_height": int(frames.shape[1]),
+                    "video_width": int(frames.shape[2]),
                 }
                 json_path = sample_dir / "metadata.json"
                 with json_path.open("w") as f:
@@ -2848,10 +2938,22 @@ def generate_navier_dataset(
                     "frames": int(frames.shape[0]),
                     "video_height": int(frames.shape[1]),
                     "video_width": int(frames.shape[2]),
+                    "panel_height": int(video_height),
+                    "panel_width": int(video_width),
+                    "stack_vorticity": bool(stack_vorticity),
+                    "video_layout": (
+                        "flow_over_vorticity" if stack_vorticity else "single"
+                    ),
                     "video_duration_seconds": float(
                         expected_video_timing["playback_duration_seconds"]
                     ),
                     "timing_verified": bool(video_timing["timing_verified"]),
+                    "timing_verification_scope": str(
+                        video_timing["timing_verification_scope"]
+                    ),
+                    "written_video_timing_verified": bool(
+                        video_timing["written_video_timing_verified"]
+                    ),
                 }
                 if latent_record is not None:
                     if "latents" in latent_record:
@@ -2940,6 +3042,90 @@ def load_video_for_wan_vae(
     return (video, dict(info))
 
 
+def load_uint8_frames_for_wan_vae(
+    frames: torch.Tensor,
+    device: Optional[str | torch.device] = None,
+    expected_size: Tuple[int, int] = DEFAULT_WAN_EXPECTED_SIZE,
+    resize: bool = False,
+) -> Tuple[torch.Tensor, Dict]:
+    """Return Wan-normalized video shaped (C, T, H, W) from uint8 video frames."""
+    device = (
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None
+        else torch.device(device)
+    )
+    if frames.ndim != 4:
+        raise ValueError("frames must have shape (T, H, W, C) or (T, C, H, W)")
+    if frames.shape[-1] <= 4:
+        frames = frames.permute(0, 3, 1, 2)
+    elif frames.shape[1] <= 4:
+        frames = frames
+    else:
+        raise ValueError("could not infer channel dimension for video frames")
+    if frames.shape[1] < 3:
+        frames = frames.repeat(1, 3, 1, 1)
+    frames = frames[:, :3]
+    frames = (
+        frames.float().div_(255.0)
+        if frames.dtype == torch.uint8
+        else frames.float().clamp_(0.0, 1.0)
+    )
+    target_h, target_w = expected_size
+    if tuple(frames.shape[-2:]) != (target_h, target_w):
+        if not resize:
+            raise ValueError(
+                f"Expected {expected_size} video frames, got {tuple(frames.shape[-2:])}"
+            )
+        frames = F.interpolate(
+            frames, size=expected_size, mode="bicubic", align_corners=False
+        ).clamp_(0.0, 1.0)
+    video = frames.mul_(2.0).sub_(1.0).permute(1, 0, 2, 3).contiguous().to(device)
+    info = {
+        "source": "in_memory_frames",
+        "decoded_video": False,
+        "frames": int(video.shape[1]),
+        "height": int(video.shape[2]),
+        "width": int(video.shape[3]),
+    }
+    return (video, info)
+
+
+def _save_wan_latents(
+    video: torch.Tensor,
+    video_info: Dict,
+    output_path: Path,
+    source_video_name: str,
+    checkpoint_dir: str | Path,
+    save_dtype: torch.dtype,
+    vae,
+) -> Dict[str, str | int | float | Tuple[int, ...]]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", category=FutureWarning, message=".*torch.cuda.amp.autocast.*"
+        )
+        latents = (
+            vae.encode([video])[0].detach().to("cpu", dtype=save_dtype).contiguous()
+        )
+    metadata = {
+        "source_video": source_video_name,
+        "vae": "Wan2.2 TI2V-5B VAE",
+        "vae_checkpoint": str(Path(checkpoint_dir) / WAN_TI2V_5B_VAE_CHECKPOINT),
+        "vae_stride": json.dumps(WAN_TI2V_5B_VAE_STRIDE),
+        "normalization": "uint8 [0,255] -> [0,1] -> [-1,1]",
+        "input_shape_cthw": json.dumps(tuple(video.shape)),
+        "latent_shape_cthw": json.dumps(tuple(latents.shape)),
+        "latent_dtype": str(latents.dtype),
+        "video_info": json.dumps(video_info, sort_keys=True),
+    }
+    save_file({"latents": latents}, str(output_path), metadata=metadata)
+    return {
+        "status": "ok",
+        "latents": str(output_path),
+        "frames": int(video.shape[1]),
+        "latent_shape": tuple(latents.shape),
+    }
+
+
 @torch.no_grad()
 def encode_video_to_wan_latents(
     video_path: str | Path,
@@ -2980,32 +3166,71 @@ def encode_video_to_wan_latents(
     video, video_info = load_video_for_wan_vae(
         video_path, device=device, expected_size=expected_size, resize=resize
     )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", category=FutureWarning, message=".*torch.cuda.amp.autocast.*"
+    record = _save_wan_latents(
+        video,
+        video_info,
+        output_path,
+        video_path.name,
+        checkpoint_dir,
+        save_dtype,
+        vae,
+    )
+    record["video"] = str(video_path)
+    return record
+
+
+@torch.no_grad()
+def encode_frames_to_wan_latents(
+    frames: torch.Tensor,
+    video_path: str | Path,
+    vae=None,
+    checkpoint_dir: str | Path = WAN_CHECKPOINT_DIR,
+    wan_repo_root: str | Path = WAN_REPO_ROOT,
+    device: Optional[str | torch.device] = None,
+    vae_dtype: torch.dtype = torch.float32,
+    save_dtype: torch.dtype = torch.float16,
+    output_path: Optional[str | Path] = None,
+    overwrite: bool = False,
+    expected_size: Tuple[int, int] = DEFAULT_WAN_EXPECTED_SIZE,
+    resize: bool = False,
+) -> Dict[str, str | int | float | Tuple[int, ...]]:
+    """Encode rendered dataset frames and save latents.safetensors beside the mp4."""
+    video_path = Path(video_path)
+    output_path = (
+        video_path.with_name("latents.safetensors")
+        if output_path is None
+        else Path(output_path)
+    )
+    if output_path.exists() and (not overwrite):
+        return {
+            "status": "skipped",
+            "reason": "exists",
+            "video": str(video_path),
+            "latents": str(output_path),
+        }
+    device = (
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None
+        else torch.device(device)
+    )
+    if vae is None:
+        vae = load_wan_ti2v_5b_vae(
+            checkpoint_dir, wan_repo_root, device=device, dtype=vae_dtype
         )
-        latents = (
-            vae.encode([video])[0].detach().to("cpu", dtype=save_dtype).contiguous()
-        )
-    metadata = {
-        "source_video": video_path.name,
-        "vae": "Wan2.2 TI2V-5B VAE",
-        "vae_checkpoint": str(Path(checkpoint_dir) / WAN_TI2V_5B_VAE_CHECKPOINT),
-        "vae_stride": json.dumps(WAN_TI2V_5B_VAE_STRIDE),
-        "normalization": "uint8 [0,255] -> [0,1] -> [-1,1]",
-        "input_shape_cthw": json.dumps(tuple(video.shape)),
-        "latent_shape_cthw": json.dumps(tuple(latents.shape)),
-        "latent_dtype": str(latents.dtype),
-        "video_info": json.dumps(video_info, sort_keys=True),
-    }
-    save_file({"latents": latents}, str(output_path), metadata=metadata)
-    return {
-        "status": "ok",
-        "video": str(video_path),
-        "latents": str(output_path),
-        "frames": int(video.shape[1]),
-        "latent_shape": tuple(latents.shape),
-    }
+    video, video_info = load_uint8_frames_for_wan_vae(
+        frames, device=device, expected_size=expected_size, resize=resize
+    )
+    record = _save_wan_latents(
+        video,
+        video_info,
+        output_path,
+        video_path.name,
+        checkpoint_dir,
+        save_dtype,
+        vae,
+    )
+    record["video"] = str(video_path)
+    return record
 
 
 def self_test_masked_projection():
@@ -3111,10 +3336,25 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--grid-size", type=int, default=NAVIER_GRID_SIZE)
     parser.add_argument("--width", type=int, default=DEFAULT_VIDEO_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_VIDEO_HEIGHT)
+    parser.add_argument(
+        "--with-vorticity",
+        "--vorticity-stack",
+        dest="stack_vorticity",
+        action="store_true",
+        help="write flow over vorticity as the dataset video",
+    )
+    parser.add_argument(
+        "--no-vorticity",
+        "--no-vorticity-stack",
+        dest="stack_vorticity",
+        action="store_false",
+        help="write only the original single flow video",
+    )
+    parser.set_defaults(stack_vorticity=DEFAULT_STACK_VORTICITY)
     parser.add_argument("--seed", type=int, default=None)
 
     parser.add_argument("--wan-repo-root", type=Path, default=DEFAULT_WAN_REPO_ROOT)
@@ -3167,6 +3407,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-relaxation-steps", type=int, default=0)
     parser.add_argument("--initial-relaxation-delta-t", type=float, default=None)
     parser.add_argument("--self-test-masked-projection", action="store_true")
+    parser.add_argument(
+        "--verify-written-videos",
+        action="store_true",
+        help="decode each written mp4 to verify container fps/timestamps",
+    )
     parser.add_argument("--no-compile", dest="use_compile", action="store_false")
     parser.set_defaults(use_compile=True)
 
@@ -3209,10 +3454,19 @@ def main() -> int:
         self_test_masked_projection()
         return 0
 
+    output_root = args.output_root
+    if output_root is None:
+        output_root = (
+            DEFAULT_WITH_VORTICITY_OUTPUT_ROOT
+            if args.stack_vorticity
+            else DEFAULT_OUTPUT_ROOT
+        )
+    output_video_height = video_height * (2 if args.stack_vorticity else 1)
+
     latent_records = []
     records = generate_navier_dataset(
         int(args.samples),
-        output_root=args.output_root,
+        output_root=output_root,
         batch_size=int(args.batch_size),
         n=int(args.grid_size),
         video_width=video_width,
@@ -3224,6 +3478,7 @@ def main() -> int:
         fps=int(args.fps),
         save_every=int(args.save_every),
         field="speed",
+        stack_vorticity=bool(args.stack_vorticity),
         delta_t=args.delta_t,
         pressure_method=args.pressure_method,
         pressure_iterations=int(args.pressure_iterations),
@@ -3243,6 +3498,7 @@ def main() -> int:
         seed=args.seed,
         device=device,
         dtype=args.sim_dtype,
+        verify_written_videos=bool(args.verify_written_videos),
         velocity_color_bound=float(args.amplitude),
         initial_projection_steps=int(args.initial_projection_steps),
         initial_projection_delta_t=float(args.initial_projection_delta_t),
@@ -3279,10 +3535,17 @@ def main() -> int:
             for item in latent_records
             if item.get("kind") == "video" and item.get("status") == "ok"
         ),
-        "output_root": str(args.output_root),
+        "output_root": str(output_root),
         "grid_size": int(args.grid_size),
-        "video_height": int(video_height),
+        "stack_vorticity": bool(args.stack_vorticity),
+        "video_layout": (
+            "flow_over_vorticity" if args.stack_vorticity else "single"
+        ),
+        "panel_height": int(video_height),
+        "panel_width": int(video_width),
+        "video_height": int(output_video_height),
         "video_width": int(video_width),
+        "verify_written_videos": bool(args.verify_written_videos),
         "fps": int(args.fps),
         "T": float(args.T),
         "frames_per_video": _prepended_initial_realtime_video_frame_count(

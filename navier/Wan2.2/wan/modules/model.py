@@ -3,10 +3,11 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as torch_checkpoint
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, frame_window_attention
 
 __all__ = ['WanModel']
 
@@ -133,23 +134,51 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
 
-        q, k, v = qkv_fn(x)
+        frame_window = getattr(self, 'frame_window', None)
+        ssm_enabled = bool(getattr(self, 'ssm_attention_enabled', False))
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        q = rope_apply(q, grid_sizes, freqs)
+        k = rope_apply(k, grid_sizes, freqs)
+        if frame_window is None and not ssm_enabled:
+            x = flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
+        else:
+            if frame_window is None:
+                frame_window = getattr(self, 'default_frame_window', (4, 0))
+            left_frames, right_frames = frame_window
+            attention_dtype = getattr(self, 'attention_dtype', torch.bfloat16)
+            x = frame_window_attention(
+                q=q,
+                k=k,
+                v=v,
+                grid_sizes=grid_sizes,
+                left_frames=int(left_frames),
+                right_frames=int(right_frames),
+                q_lens=seq_lens,
+                k_lens=seq_lens,
+                dtype=attention_dtype,
+            )
+            if ssm_enabled:
+                ssm_memory = getattr(self, 'ssm_memory', None)
+                if ssm_memory is None:
+                    raise RuntimeError(
+                        'ssm_attention_enabled=True but this attention layer has no ssm_memory module')
+                x = x + ssm_memory(
+                    q=q,
+                    k=k,
+                    v=v,
+                    grid_sizes=grid_sizes,
+                    seq_lens=seq_lens,
+                )
 
-        # output
         x = x.flatten(2)
         x = self.o(x)
         return x
@@ -216,15 +245,13 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(
+    def _forward_impl(
         self,
         x,
         e,
         seq_lens,
         grid_sizes,
         freqs,
-        context,
-        context_lens,
     ):
         r"""
         Args:
@@ -242,21 +269,51 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens,
+            grid_sizes,
+            freqs)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        # FFN path. Text cross-attention is intentionally disabled for the
+        # Navier setup.
+        def ffn_fn(x, e):
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             with torch.amp.autocast('cuda', dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = ffn_fn(x, e)
         return x
+
+    def forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+    ):
+        if not (self.training and getattr(self, 'gradient_checkpointing', False)):
+            return self._forward_impl(
+                x,
+                e=e,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+            )
+
+        def run(activation):
+            return self._forward_impl(
+                activation,
+                e=e,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+            )
+
+        return torch_checkpoint.checkpoint(run, x, use_reentrant=False)
 
 
 class Head(nn.Module):
@@ -407,6 +464,74 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+    def _ensure_rope_capacity(self, grid_sizes, device):
+        max_position = int(grid_sizes.max().item())
+        if max_position <= int(self.freqs.size(0)):
+            return
+        head_dim = int(self.dim) // int(self.num_heads)
+        self.freqs = torch.cat([
+            rope_params(max_position, head_dim - 4 * (head_dim // 6)),
+            rope_params(max_position, 2 * (head_dim // 6)),
+            rope_params(max_position, 2 * (head_dim // 6))
+        ],
+                               dim=1).to(device)
+
+    @staticmethod
+    def _latent_list(value, name):
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 5:
+                return [u for u in value]
+            if value.dim() == 4:
+                return [value]
+            raise ValueError(
+                f'{name} tensor must have shape [B,C,F,H,W] or [C,F,H,W], got {tuple(value.shape)}')
+        return list(value)
+
+    def _patch_embedding_forward(self, x):
+        tokens = self.patch_embedding(x)
+        adapter = getattr(self, 'patch_embedding_lora', None)
+        if adapter is not None:
+            tokens = tokens + adapter(x).to(dtype=tokens.dtype)
+        return tokens
+
+    def _time_projection_forward(self, e):
+        tokens = self.time_projection(e)
+        adapter = getattr(self, 'timestep_adaln_lora', None)
+        if adapter is not None:
+            time_hidden = self.time_projection[0](e)
+            tokens = tokens + adapter(time_hidden).to(dtype=tokens.dtype)
+        return tokens
+
+    def _first_frame_adaln_tokens(self, first_frame, token_batches, grid_sizes):
+        if not hasattr(self, 'first_frame_adaln'):
+            raise RuntimeError(
+                'first_frame was provided, but this WanModel has no first_frame_adaln modules')
+
+        device = self.patch_embedding.weight.device
+        tokens_out = []
+        for item_index, (tokens, condition_latent) in enumerate(
+                zip(token_batches, first_frame)):
+            condition_tokens = self._patch_embedding_forward(
+                condition_latent.to(
+                    device=device,
+                    dtype=self.patch_embedding.weight.dtype).unsqueeze(0))
+            if int(condition_tokens.shape[2]) != 1:
+                raise ValueError(
+                    'first_frame must contain exactly one latent frame after patchification')
+            condition_tokens = condition_tokens.flatten(2).transpose(1, 2)
+            frame_count, grid_h, grid_w = grid_sizes[item_index].tolist()
+            spatial_tokens = int(grid_h) * int(grid_w)
+            if condition_tokens.size(1) != spatial_tokens:
+                raise ValueError(
+                    f'first_frame produced {condition_tokens.size(1)} spatial tokens, expected {spatial_tokens}')
+            condition_tokens = (
+                condition_tokens.to(dtype=torch.float32)
+                .reshape(1, 1, spatial_tokens, self.dim)
+                .expand(1, int(frame_count), spatial_tokens, self.dim)
+                .reshape(1, int(frame_count) * spatial_tokens, self.dim))
+            tokens_out.append(condition_tokens)
+        return tokens_out
+
     def forward(
         self,
         x,
@@ -414,6 +539,8 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        physics=None,
+        first_frame=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -441,52 +568,115 @@ class WanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
+        x = self._latent_list(x, 'x')
+        if first_frame is not None:
+            first_frame = self._latent_list(first_frame, 'first_frame')
+            if len(first_frame) != len(x):
+                raise ValueError(
+                    f'first_frame batch has {len(first_frame)} items but x has {len(x)}')
+
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        x = [self._patch_embedding_forward(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            [torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x])
+        self._ensure_rope_capacity(grid_sizes, device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        first_frame_adaln_tokens = (
+            self._first_frame_adaln_tokens(first_frame, x, grid_sizes)
+            if first_frame is not None
+            else None)
+        seq_lens = torch.tensor([u.size(1) for u in x],
+                                dtype=torch.long,
+                                device=device)
         assert seq_lens.max() <= seq_len
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
+        if first_frame_adaln_tokens is not None:
+            first_frame_adaln_tokens = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                          dim=1) for u in first_frame_adaln_tokens
+            ])
 
-        # time embeddings
+        # Text conditioning is disabled for the Navier setup.
+        # Timestep AdaLN can be toggled from the training config while keeping
+        # the same timestep tensor shape at call sites.
+        del context
+        timestep_conditioning_enabled = bool(
+            getattr(self, 'timestep_conditioning_enabled', True))
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
+        if t.dim() != 2:
+            raise ValueError(
+                f't must have shape [B] or [B, seq_len], got {tuple(t.shape)}')
+        if int(t.size(1)) != int(seq_len):
+            raise ValueError(
+                f't timestep token count {int(t.size(1))} does not match seq_len {int(seq_len)}')
+        if int(t.size(0)) != int(x.size(0)):
+            raise ValueError(
+                f't batch size {int(t.size(0))} does not match x batch size {int(x.size(0))}')
         with torch.amp.autocast('cuda', dtype=torch.float32):
             bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            if timestep_conditioning_enabled:
+                t = t.to(device=device, dtype=torch.float32).flatten()
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t).unflatten(
+                        0, (bt, seq_len)).float().to(device))
+                e0 = self._time_projection_forward(e).unflatten(2, (6, self.dim))
+            else:
+                e = torch.zeros(
+                    bt, seq_len, self.dim, device=device, dtype=torch.float32)
+                e0 = torch.zeros(
+                    bt, seq_len, 6, self.dim, device=device, dtype=torch.float32)
+            physics_condition = None
+            if physics is not None:
+                if not hasattr(self, 'physics_adaln'):
+                    raise RuntimeError(
+                        'physics was provided, but this WanModel has no physics_adaln modules')
+                physics = physics.to(device=device, dtype=torch.float32)
+                if physics.shape != (bt, 2):
+                    raise ValueError(
+                        f'physics must have shape ({bt}, 2), got {tuple(physics.shape)}')
+                physics_condition = physics
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
-
-        # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
 
         # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            context_lens=context_lens)
+            freqs=self.freqs)
 
-        for block in self.blocks:
+        dropped_layers = set(int(index) for index in getattr(
+            self, 'dropped_transformer_layers', ()))
+        training_dropped_layer = getattr(
+            self, '_dropped_transformer_layer_index', None)
+        for block_index, block in enumerate(self.blocks):
+            if block_index in dropped_layers:
+                continue
+            if training_dropped_layer == block_index:
+                continue
+            block_e0 = e0
+            if physics_condition is not None:
+                block_physics_e0 = self.physics_adaln[block_index](
+                    physics_condition).view(bt, 1, 6, self.dim)
+                block_e0 = block_e0 + block_physics_e0
+            if first_frame_adaln_tokens is not None:
+                first_frame_key = str(block_index)
+                first_frame_adapter = (
+                    self.first_frame_adaln[first_frame_key]
+                    if first_frame_key in self.first_frame_adaln
+                    else None)
+                if first_frame_adapter is not None:
+                    first_frame_e0 = first_frame_adapter(
+                        first_frame_adaln_tokens).reshape(
+                            bt, seq_len, 6, self.dim)
+                    block_e0 = block_e0 + first_frame_e0
+            kwargs['e'] = block_e0
             x = block(x, **kwargs)
 
         # head
