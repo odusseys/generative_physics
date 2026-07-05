@@ -50,6 +50,16 @@ class TrainingConfig:
     fourier_max_frequency: int = 32
     fourier_shift: bool = True
 
+    airfoil_grid_size: int = 256
+    airfoil_min_points: int = 5
+    airfoil_max_points: int = 10
+    airfoil_samples_per_segment: int = 28
+    airfoil_handle_scale: float = 0.12
+    airfoil_body_box_fraction: float = 0.5
+    airfoil_x_stretch: float = 1.8
+    airfoil_y_stretch: float = 0.55
+    airfoil_flow_speed: float = 1.0
+
     num_train_pairs: int = 2048
     num_eval_pairs: int = 24
     train_seed_offset: int = 10_000
@@ -82,8 +92,10 @@ class TrainingConfig:
             return "Poisson"
         if self.pde_kind == "fourier":
             return "Fourier Transform"
+        if self.pde_kind == "airfoil":
+            return "Airfoil Potential Flow"
         raise ValueError(
-            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', or 'fourier'."
+            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'fourier', or 'airfoil'."
         )
 
     @property
@@ -104,6 +116,8 @@ class TrainingConfig:
                 f"Given a scalar function image with {self.fourier_num_modes} random-covariance Gaussian modes, "
                 "generate the log magnitude of its 2D Fourier transform."
             )
+        if self.pde_kind == "airfoil":
+            return "Given the no-flow airfoil image in uniform rightward flow, generate the potential-flow image."
         return f"Given the initial 1D {self.pde_name} condition image, generate the {self.pde_name} time-evolution image."
 
     @property
@@ -122,4 +136,6 @@ class TrainingConfig:
     def sim_batch_size(self) -> int:
         if self.pde_kind in {"poisson", "fourier"}:
             return 32 if torch.cuda.is_available() else 1
+        if self.pde_kind == "airfoil":
+            return 1
         return 256 if torch.cuda.is_available() else 1

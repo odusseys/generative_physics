@@ -90,6 +90,15 @@ EVAL_ERROR_VMAX = 0.45
 VIDEO_OUTPUT_SIZE = 256
 SAVE_EVERY = None
 
+WANDB_ENABLED = False
+WANDB_PROJECT = "navier-autoreg"
+WANDB_ENTITY = None
+WANDB_RUN_NAME = None
+WANDB_MODE = None
+WANDB_TAGS = ()
+WANDB_LOG_DEBUG_VIDEOS = True
+WANDB_FRAME_LOSS_TIMESTEPS = (1, 5, 10, 15, 20, 25, 30, 35, 39)
+
 LORA_R = 16
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.0
@@ -166,6 +175,14 @@ CONFIG_KEYS = (
     "EVAL_ERROR_VMAX",
     "VIDEO_OUTPUT_SIZE",
     "SAVE_EVERY",
+    "WANDB_ENABLED",
+    "WANDB_PROJECT",
+    "WANDB_ENTITY",
+    "WANDB_RUN_NAME",
+    "WANDB_MODE",
+    "WANDB_TAGS",
+    "WANDB_LOG_DEBUG_VIDEOS",
+    "WANDB_FRAME_LOSS_TIMESTEPS",
     "LORA_R",
     "LORA_ALPHA",
     "LORA_DROPOUT",
@@ -209,6 +226,7 @@ def configure(**overrides):
     _validate_causal_window()
     _validate_progressive_sequence_length()
     _validate_flow_matching_config()
+    _validate_wandb_config()
     if "RANDOM_SEED" in overrides:
         random.seed(RANDOM_SEED)
         torch.manual_seed(RANDOM_SEED)
@@ -227,6 +245,14 @@ def _validate_causal_window() -> None:
 def causal_window() -> tuple[int, int]:
     _validate_causal_window()
     return int(WINDOW_LEFT_FRAMES), 0
+
+
+def _validate_wandb_config() -> None:
+    for timestep in WANDB_FRAME_LOSS_TIMESTEPS:
+        if int(timestep) < 0:
+            raise ValueError(
+                f"WANDB_FRAME_LOSS_TIMESTEPS must be non-negative, got {timestep!r}"
+            )
 
 
 def _validate_progressive_sequence_length() -> None:

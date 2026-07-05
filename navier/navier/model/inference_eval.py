@@ -682,7 +682,12 @@ def evaluate_random_holdout(
 
     lora_video = decode_latents_to_video(vae, lora_latents)
     ground_truth_video = decode_latents_to_video(vae, clean_latents)
-    html = display_prediction_triplet(lora_video, ground_truth_video)
+    debug_video_frames = prediction_triplet_frames(lora_video, ground_truth_video)
+    html = display_rgb_frames(debug_video_frames, fps=EVAL_FPS)
+    caption = (
+        f"step {int(step)} {sample.name}: {eval_label}; "
+        "left=prediction, middle=ground truth, right=absolute error"
+    )
     print(
         f"step {step}: {sample.name} | "
         f"nu={sample.nu:.2e}, rho={sample.rho:.3g} | "
@@ -717,6 +722,8 @@ def evaluate_random_holdout(
     result = {
         "sample": sample,
         "html": html,
+        "caption": caption,
+        "debug_video_frames": debug_video_frames,
         "frame_loss_histogram": frame_loss_histogram,
         "layer_drop_loss_histogram": layer_drop_loss_histogram,
     }

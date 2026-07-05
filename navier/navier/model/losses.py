@@ -116,7 +116,8 @@ def _flow_matching_loss_components(
     target_future = target_velocity[:, :, 1:].float()
     flow_loss = F.mse_loss(pred_future, target_future)
     assert_finite_tensor(loss_name, flow_loss)
-    return flow_loss, frame_mse(pred_future, target_future).detach()
+    diagnostic_frame_loss = frame_mse(pred_future, target_future).detach()
+    return flow_loss, diagnostic_frame_loss
 
 
 def _full_sequence_flow_matching_batch(

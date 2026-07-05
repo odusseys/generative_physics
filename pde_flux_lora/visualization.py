@@ -35,7 +35,8 @@ def show_random_inference_grid(
         ground_truth = as_pil_image(record["solution"])
         is_poisson = record["params"].get("pde") == "poisson"
         is_fourier = record["params"].get("pde") == "fourier"
-        is_condition_to_image = is_poisson or is_fourier
+        is_airfoil = record["params"].get("pde") == "airfoil"
+        is_condition_to_image = is_poisson or is_fourier or is_airfoil
         thermal_diffusivity = record["params"].get("thermal_diffusivity")
         coefficient_label = ""
         if thermal_diffusivity is not None:

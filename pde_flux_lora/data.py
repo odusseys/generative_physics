@@ -4,6 +4,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
+from .airfoil import generate_airfoil_image_pairs
 from .burgers import generate_burgers_image_pairs
 from .cgl import generate_cgl_image_pairs
 from .config import TrainingConfig
@@ -33,6 +34,8 @@ def make_pde_records(
             sim_nx = config.poisson_grid_size
         elif config.pde_kind == "fourier":
             sim_nx = config.fourier_grid_size
+        elif config.pde_kind == "airfoil":
+            sim_nx = config.airfoil_grid_size
         else:
             sim_nx = config.sim_nx
     sim_batch_size = config.sim_batch_size if sim_batch_size is None else sim_batch_size
@@ -122,9 +125,23 @@ def make_pde_records(
                 fft_shift=config.fourier_shift,
                 sim_device=sim_device,
             )
+        elif config.pde_kind == "airfoil":
+            pairs = generate_airfoil_image_pairs(
+                seed_chunk,
+                sim_nx=sim_nx,
+                output_size=image_size,
+                min_points=config.airfoil_min_points,
+                max_points=config.airfoil_max_points,
+                samples_per_segment=config.airfoil_samples_per_segment,
+                handle_scale=config.airfoil_handle_scale,
+                body_box=sim_nx * config.airfoil_body_box_fraction,
+                x_stretch=config.airfoil_x_stretch,
+                y_stretch=config.airfoil_y_stretch,
+                flow_speed=config.airfoil_flow_speed,
+            )
         else:
             raise ValueError(
-                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', or 'fourier'."
+                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'fourier', or 'airfoil'."
             )
 
         for pair in pairs:

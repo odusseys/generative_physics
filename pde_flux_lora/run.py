@@ -64,6 +64,8 @@ def run_training(config=None):
         data_grid_size = config.poisson_grid_size
     elif config.pde_kind == "fourier":
         data_grid_size = config.fourier_grid_size
+    elif config.pde_kind == "airfoil":
+        data_grid_size = config.airfoil_grid_size
 
     print("generating training records...")
     print(
@@ -87,6 +89,13 @@ def run_training(config=None):
             f"{config.fourier_num_modes} random-covariance Gaussian modes, "
             f"sigma={config.fourier_gaussian_sigma_min:g}..{config.fourier_gaussian_sigma_max:g}, "
             f"scale={config.fourier_scale:g}, fft_shift={config.fourier_shift}"
+        )
+    elif config.pde_kind == "airfoil":
+        print(
+            "Airfoil flow: "
+            f"points={config.airfoil_min_points}..{config.airfoil_max_points}, "
+            f"stretch=({config.airfoil_x_stretch:g}, {config.airfoil_y_stretch:g}), "
+            f"U={config.airfoil_flow_speed:g}"
         )
     train_records = make_pde_records(
         config.num_train_pairs,

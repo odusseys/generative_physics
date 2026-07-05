@@ -1,2 +1,5 @@
 **/__pycache__/
 navier/autoreg_lora_outputs/
+dbnFiles.zip
+dbnFiles/
+**/wandb

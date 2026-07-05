@@ -237,6 +237,220 @@ def checkpoint_saving_enabled() -> bool:
     return SAVE_EVERY is not None and int(SAVE_EVERY) > 0
 
 
+_WANDB_RUN = None
+_WANDB_RUN_OWNED = False
+_WANDB_UNAVAILABLE_REASON = None
+
+
+def _wandb_config_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_wandb_config_value(item) for item in value]
+    if isinstance(value, set):
+        return [_wandb_config_value(item) for item in sorted(value)]
+    if isinstance(value, dict):
+        return {str(key): _wandb_config_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _wandb_run_config(max_steps: Optional[int] = None) -> dict:
+    config = {
+        key: _wandb_config_value(value)
+        for key, value in get_config().items()
+        if not key.startswith("WANDB_")
+    }
+    config["resolved_max_steps"] = int(max_steps) if max_steps is not None else None
+    return config
+
+
+def wandb_tracking_enabled() -> bool:
+    return bool(WANDB_ENABLED)
+
+
+def initialize_wandb_run(max_steps: Optional[int] = None):
+    global _WANDB_RUN, _WANDB_RUN_OWNED, _WANDB_UNAVAILABLE_REASON
+    if not wandb_tracking_enabled():
+        return None
+    if _WANDB_UNAVAILABLE_REASON is not None:
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        _WANDB_UNAVAILABLE_REASON = str(exc)
+        warnings.warn(f"W&B tracking disabled; could not import wandb: {exc}")
+        return None
+
+    if wandb.run is not None:
+        _WANDB_RUN = wandb.run
+        _WANDB_RUN_OWNED = False
+        return _WANDB_RUN
+
+    init_kwargs = {
+        "project": WANDB_PROJECT,
+        "config": _wandb_run_config(max_steps=max_steps),
+    }
+    if WANDB_ENTITY:
+        init_kwargs["entity"] = WANDB_ENTITY
+    if WANDB_RUN_NAME:
+        init_kwargs["name"] = WANDB_RUN_NAME
+    if WANDB_MODE:
+        init_kwargs["mode"] = WANDB_MODE
+    if WANDB_TAGS:
+        init_kwargs["tags"] = list(WANDB_TAGS)
+
+    try:
+        _WANDB_RUN = wandb.init(**init_kwargs)
+    except Exception as exc:
+        _WANDB_UNAVAILABLE_REASON = str(exc)
+        warnings.warn(f"W&B tracking disabled; wandb.init failed: {exc}")
+        _WANDB_RUN = None
+        _WANDB_RUN_OWNED = False
+        return None
+    _WANDB_RUN_OWNED = True
+    return _WANDB_RUN
+
+
+def finish_wandb_run() -> None:
+    global _WANDB_RUN, _WANDB_RUN_OWNED
+    if _WANDB_RUN is None:
+        return
+    if _WANDB_RUN_OWNED:
+        try:
+            _WANDB_RUN.finish()
+        except Exception as exc:
+            warnings.warn(f"W&B finish failed: {exc}")
+    _WANDB_RUN = None
+    _WANDB_RUN_OWNED = False
+
+
+def _active_wandb_run():
+    if not wandb_tracking_enabled() or _WANDB_UNAVAILABLE_REASON is not None:
+        return None
+    try:
+        import wandb
+    except Exception:
+        return None
+    return _WANDB_RUN if _WANDB_RUN is not None else wandb.run
+
+
+def _mean_step_losses(step_losses) -> dict:
+    values = {}
+    for name, losses in step_losses.items():
+        if losses:
+            values[name] = float(sum(losses) / len(losses))
+    return values
+
+
+def _mean_step_frame_loss(step_frame_losses) -> Optional[torch.Tensor]:
+    if not step_frame_losses:
+        return None
+    lengths = {int(frame_loss.numel()) for frame_loss in step_frame_losses}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"Inconsistent per-frame loss lengths in step: {sorted(lengths)}"
+        )
+    frame_loss = torch.stack(step_frame_losses, dim=0).mean(dim=0)
+    if frame_loss.numel() < 1:
+        return None
+    return frame_loss.detach().to(device="cpu", dtype=torch.float32)
+
+
+def wandb_log_training_step(
+    state,
+    step: int,
+    step_losses,
+    step_frame_losses,
+    *,
+    active_latent_frame_count: Optional[int],
+    learning_rate: float,
+    dropped_layer_index: Optional[int],
+) -> None:
+    run = _active_wandb_run()
+    if run is None:
+        return
+    try:
+        import wandb
+    except Exception:
+        return
+
+    logs = {
+        "train/learning_rate": float(learning_rate),
+    }
+    if active_latent_frame_count is not None:
+        logs["train/active_latent_frame_count"] = int(active_latent_frame_count)
+    if dropped_layer_index is not None:
+        logs["train/dropped_layer_index"] = int(dropped_layer_index)
+
+    losses = _mean_step_losses(step_losses)
+    for name, value in losses.items():
+        logs[f"train/{name}_loss_step"] = float(value)
+    if "total" in losses:
+        logs["train/loss_step"] = float(losses["total"])
+    elif "mse" in losses:
+        logs["train/loss_step"] = float(losses["mse"])
+
+    frame_loss = _mean_step_frame_loss(step_frame_losses)
+    if frame_loss is not None:
+        state["last_step_frame_loss"] = frame_loss
+        frame_loss_indices = list(range(1, 1 + int(frame_loss.numel())))
+        state["last_step_frame_loss_indices"] = frame_loss_indices
+        for timestep in WANDB_FRAME_LOSS_TIMESTEPS:
+            timestep = int(timestep)
+            if timestep in frame_loss_indices:
+                frame_loss_offset = timestep - 1
+                logs[f"train/frame_loss_t{timestep:02d}_step"] = float(
+                    frame_loss[frame_loss_offset].item()
+                )
+
+    try:
+        wandb.log(logs, step=int(step))
+    except Exception as exc:
+        warnings.warn(f"W&B training log failed at step {step}: {exc}")
+
+
+def _wandb_video_from_frames(frames: torch.Tensor, caption: str):
+    import wandb
+
+    frames = frames.detach().to(torch.uint8).cpu()
+    video = frames.permute(0, 3, 1, 2).numpy()
+    return wandb.Video(video, fps=int(EVAL_FPS), format="mp4", caption=caption)
+
+
+def wandb_log_evaluation(step: int, result: Optional[dict]) -> None:
+    run = _active_wandb_run()
+    if run is None or not result:
+        return
+    try:
+        import wandb
+    except Exception:
+        return
+
+    logs = {}
+    sample = result.get("sample")
+    if sample is not None:
+        logs["eval/sample"] = sample.name
+        logs["eval/nu"] = float(sample.nu)
+        logs["eval/rho"] = float(sample.rho)
+    if WANDB_LOG_DEBUG_VIDEOS:
+        frames = result.get("debug_video_frames")
+        if frames is not None:
+            caption = result.get("caption") or f"debug video step {int(step)}"
+            logs["eval/debug_video"] = _wandb_video_from_frames(frames, caption)
+    if not logs:
+        return
+    try:
+        wandb.log(logs, step=int(step))
+    except Exception as exc:
+        warnings.warn(f"W&B evaluation log failed at step {step}: {exc}")
+
+
 FLOW_MATCHING_LOSS_KEYS = (
     "mse",
     "total",
