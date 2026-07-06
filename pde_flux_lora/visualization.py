@@ -75,20 +75,12 @@ def show_random_inference_grid(
                 axes[row, col].imshow(forcing_image)
                 axes[row, col].set_title(f"forcing{forcing_label}")
             col += 1
-        if is_condition_to_image:
-            axes[row, col].imshow(ground_truth)
-            axes[row, col].set_title("ground truth")
-            col += 1
-            axes[row, col].imshow(generated)
-            axes[row, col].set_title("predicted")
-            col += 1
-        else:
-            axes[row, col].imshow(generated)
-            axes[row, col].set_title(f"generated {pde_name}{coefficient_label}")
-            col += 1
-            axes[row, col].imshow(ground_truth)
-            axes[row, col].set_title(f"ground truth {pde_name}{coefficient_label}")
-            col += 1
+        axes[row, col].imshow(generated)
+        axes[row, col].set_title("inference" if is_condition_to_image else f"inference {pde_name}{coefficient_label}")
+        col += 1
+        axes[row, col].imshow(ground_truth)
+        axes[row, col].set_title("ground truth" if is_condition_to_image else f"ground truth {pde_name}{coefficient_label}")
+        col += 1
         axes[row, col].imshow(abs_error, cmap="magma", vmin=0.0, vmax=0.1)
         axes[row, col].set_title(f"abs error mean={abs_error.mean():.3f}")
 
@@ -125,6 +117,9 @@ def show_smoothed_loss(loss_history, alpha=0.08):
     ax.set_title(f"training loss through step {len(loss_history) - 1}")
     ax.set_xlabel("optimizer step")
     ax.set_ylabel("MSE loss")
+    ymax = float(np.quantile(losses, 0.7))
+    if np.isfinite(ymax) and ymax > 0:
+        ax.set_ylim(bottom=0.0, top=ymax)
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     plt.tight_layout()

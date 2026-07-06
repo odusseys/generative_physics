@@ -1,5 +1,6 @@
 import gc
 import random
+import sys
 from itertools import cycle
 
 import numpy as np
@@ -67,7 +68,6 @@ def run_training(config=None):
     elif config.pde_kind == "airfoil":
         data_grid_size = config.airfoil_grid_size
 
-    print("generating training records...")
     print(
         f"Generating {config.pde_name} data: sim_nx={data_grid_size}, save_steps={config.sim_save_steps}, "
         f"image={config.output_image_size}x{config.output_image_size}, initial_grid={config.initial_grid_size}, "
@@ -95,8 +95,10 @@ def run_training(config=None):
             "Airfoil flow: "
             f"points={config.airfoil_min_points}..{config.airfoil_max_points}, "
             f"stretch=({config.airfoil_x_stretch:g}, {config.airfoil_y_stretch:g}), "
-            f"U={config.airfoil_flow_speed:g}"
+            f"U={config.airfoil_flow_speed:g}, color={config.airfoil_color_mode}, "
+            f"workers={config.airfoil_num_workers or 'auto'}"
         )
+    print("generating training records...")
     train_records = make_pde_records(
         config.num_train_pairs,
         seed_offset=config.train_seed_offset,
@@ -191,8 +193,19 @@ def run_training(config=None):
     loader_iter = cycle(train_loader)
     printed_schedule = False
     loss_history = []
+    ema_loss = None
+    ema_loss_decay = 0.95
 
-    progress = tqdm(range(0, config.max_train_steps + 1), desc="LoRA steps")
+    print("starting LoRA training; tqdm shows loss and ema")
+    progress = tqdm(
+        range(0, config.max_train_steps + 1),
+        desc="LoRA steps",
+        file=sys.stdout,
+        miniters=1,
+        mininterval=0.1,
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
     for global_step in progress:
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
@@ -216,9 +229,15 @@ def run_training(config=None):
         optimizer.step()
 
         loss_history.append(accumulated_loss)
-        progress.set_postfix(loss=f"{accumulated_loss:.4f}")
+        if ema_loss is None:
+            ema_loss = accumulated_loss
+        else:
+            ema_loss = ema_loss_decay * ema_loss + (1.0 - ema_loss_decay) * accumulated_loss
+        progress.set_description(f"LoRA steps loss={accumulated_loss:.4f} ema={ema_loss:.4f}")
+        progress.set_postfix_str(f"loss={accumulated_loss:.4f} ema={ema_loss:.4f}", refresh=True)
 
-        if config.validate_every_n_steps and global_step % config.validate_every_n_steps == 0:
+        if config.validate_every_n_steps and global_step > 0 and global_step % config.validate_every_n_steps == 0:
+            progress.write(f"validation inference at step {global_step}")
             show_random_inference_grid(
                 pipe,
                 eval_records,
@@ -228,7 +247,7 @@ def run_training(config=None):
                 pde_name=config.pde_name,
                 train_image_size=config.train_image_size,
                 num_inference_steps=config.distilled_num_inference_steps,
-                n=8,
+                n=config.validation_num_images,
                 seed=config.seed + global_step,
             )
             show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)
@@ -253,7 +272,7 @@ def run_training(config=None):
         pde_name=config.pde_name,
         train_image_size=config.train_image_size,
         num_inference_steps=config.distilled_num_inference_steps,
-        n=8,
+        n=config.validation_num_images,
         seed=config.seed,
     )
     show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)

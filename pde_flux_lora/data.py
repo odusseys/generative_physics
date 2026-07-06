@@ -4,7 +4,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
-from .airfoil import generate_airfoil_image_pairs
+from .airfoil import generate_airfoil_image_pairs_parallel
 from .burgers import generate_burgers_image_pairs
 from .cgl import generate_cgl_image_pairs
 from .config import TrainingConfig
@@ -43,6 +43,34 @@ def make_pde_records(
 
     records = []
     seeds = list(range(seed_offset, seed_offset + num_pairs))
+    if config.pde_kind == "airfoil":
+        pairs = generate_airfoil_image_pairs_parallel(
+            seeds,
+            num_workers=config.airfoil_num_workers,
+            worker_chunksize=config.airfoil_worker_chunksize,
+            progress=True,
+            progress_desc=f"{config.pde_name} sims {seed_offset}",
+            sim_nx=sim_nx,
+            output_size=image_size,
+            min_points=config.airfoil_min_points,
+            max_points=config.airfoil_max_points,
+            samples_per_segment=config.airfoil_samples_per_segment,
+            handle_scale=config.airfoil_handle_scale,
+            body_box=sim_nx * config.airfoil_body_box_fraction,
+            x_stretch=config.airfoil_x_stretch,
+            y_stretch=config.airfoil_y_stretch,
+            flow_speed=config.airfoil_flow_speed,
+            speed_vmin=config.airfoil_speed_vmin,
+            speed_vmax=config.airfoil_speed_vmax,
+            color_mode=config.airfoil_color_mode,
+        )
+        for solution_img, initial_img, params in pairs:
+            records.append({"initial": initial_img, "solution": solution_img, "params": params})
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
     chunks = range(0, num_pairs, sim_batch_size)
     for start in tqdm(chunks, desc=f"{config.pde_name} sims {seed_offset}", position=0, leave=True):
         seed_chunk = seeds[start : start + sim_batch_size]
@@ -124,20 +152,6 @@ def make_pde_records(
                 sigma_max=config.fourier_gaussian_sigma_max,
                 fft_shift=config.fourier_shift,
                 sim_device=sim_device,
-            )
-        elif config.pde_kind == "airfoil":
-            pairs = generate_airfoil_image_pairs(
-                seed_chunk,
-                sim_nx=sim_nx,
-                output_size=image_size,
-                min_points=config.airfoil_min_points,
-                max_points=config.airfoil_max_points,
-                samples_per_segment=config.airfoil_samples_per_segment,
-                handle_scale=config.airfoil_handle_scale,
-                body_box=sim_nx * config.airfoil_body_box_fraction,
-                x_stretch=config.airfoil_x_stretch,
-                y_stretch=config.airfoil_y_stretch,
-                flow_speed=config.airfoil_flow_speed,
             )
         else:
             raise ValueError(

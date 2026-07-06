@@ -1,8 +1,11 @@
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.path import Path
+from PIL import Image, ImageDraw
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import spsolve
 
@@ -204,13 +207,9 @@ def _render_airfoil_image(
     body_xy,
     speed,
     output_size=256,
+    vmin=0.5,
     vmax=None,
     cmap_name="viridis",
-    stream_u=None,
-    stream_v=None,
-    stream_density=0.55,
-    stream_linewidth=0.55,
-    stream_arrowsize=0.65,
 ):
     n = speed.shape[0]
     dpi = 100
@@ -221,26 +220,16 @@ def _render_airfoil_image(
 
     cmap = plt.colormaps[cmap_name].copy()
     cmap.set_bad(color="white")
+    clipped_speed = np.ma.clip(speed, vmin, vmax)
     ax.imshow(
-        speed,
+        clipped_speed,
         origin="lower",
         extent=[0, n, 0, n],
-        vmin=0.0,
+        vmin=vmin,
         vmax=vmax,
         cmap=cmap,
         interpolation="bilinear",
     )
-    if stream_u is not None and stream_v is not None:
-        ax.streamplot(
-            np.arange(n),
-            np.arange(n),
-            stream_u,
-            stream_v,
-            density=stream_density,
-            linewidth=stream_linewidth,
-            arrowsize=stream_arrowsize,
-            color="black",
-        )
     ax.plot(body_xy[:, 0], body_xy[:, 1], color="black", linewidth=1.2)
 
     ax.set_xlim(0, n)
@@ -252,6 +241,42 @@ def _render_airfoil_image(
     image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
     plt.close(fig)
     return image
+
+
+def _resize_and_outline_airfoil(rgb, body_xy, sim_nx, output_size, outline_width=1):
+    image = Image.fromarray(np.ascontiguousarray(rgb))
+    if image.size != (output_size, output_size):
+        image = image.resize((output_size, output_size), Image.Resampling.BICUBIC)
+
+    scale = float(output_size) / float(sim_nx)
+    outline_xy = [(float(x) * scale, float(output_size) - float(y) * scale) for x, y in body_xy]
+    draw = ImageDraw.Draw(image)
+    draw.line(outline_xy, fill=(0, 0, 0), width=max(1, int(outline_width)), joint="curve")
+    return np.asarray(image.convert("RGB")).copy()
+
+
+def _render_airfoil_rgb_image(body_xy, u, v, speed, inside, output_size=256, vmin=0.5, vmax=None):
+    sim_nx = speed.shape[0]
+    vmin = float(vmin)
+    vmax = float(vmax)
+    span = max(vmax - vmin, 1e-6)
+
+    speed_arr = np.asarray(np.ma.filled(speed, 0.0), dtype=np.float32)
+    speed_magnitude = np.clip(speed_arr, vmin, vmax)
+    u_arr = np.asarray(np.ma.filled(u, 0.0), dtype=np.float32)
+    v_arr = np.asarray(np.ma.filled(v, 0.0), dtype=np.float32)
+    speed_safe = np.maximum(speed_arr, 1e-6)
+    unit_u = np.where(speed_arr > 1e-6, u_arr / speed_safe, 0.0)
+    unit_v = np.where(speed_arr > 1e-6, v_arr / speed_safe, 0.0)
+
+    rgb = np.empty((sim_nx, sim_nx, 3), dtype=np.float32)
+    rgb[..., 0] = (speed_magnitude - vmin) / span
+    rgb[..., 1] = np.clip(0.5 * (unit_u + 1.0), 0.0, 1.0)
+    rgb[..., 2] = np.clip(0.5 * (unit_v + 1.0), 0.0, 1.0)
+    rgb[inside] = 1.0
+
+    rgb_uint8 = np.flipud((rgb * 255.0).round().astype(np.uint8))
+    return _resize_and_outline_airfoil(rgb_uint8, body_xy, sim_nx=sim_nx, output_size=output_size)
 
 
 def generate_airfoil_image_pairs(
@@ -266,16 +291,18 @@ def generate_airfoil_image_pairs(
     x_stretch=1.8,
     y_stretch=0.55,
     flow_speed=1.0,
+    speed_vmin=0.5,
+    speed_vmax=2.1,
     cmap_name="viridis",
-    stream_density=0.55,
-    stream_linewidth=0.55,
-    stream_arrowsize=0.65,
+    color_mode="viridis",
 ):
     seeds = list(seeds)
     if not seeds:
         raise ValueError("seeds must contain at least one seed")
     if output_size <= 0:
         raise ValueError("output_size must be positive")
+    if speed_vmin >= speed_vmax:
+        raise ValueError("airfoil speed_vmin must be < airfoil speed_vmax")
 
     pairs = []
     body_box = float(sim_nx) * 0.5 if body_box is None else float(body_box)
@@ -295,28 +322,52 @@ def generate_airfoil_image_pairs(
             y_stretch=y_stretch,
         )
         u, v, speed, inside = solve_potential_flow(body_xy, n=sim_nx, U=flow_speed)
-        vmax = max(float(np.nanpercentile(speed.compressed(), 98.5)), float(flow_speed), 1e-6)
+        vmin = float(speed_vmin)
+        vmax = float(speed_vmax)
         no_flow_speed = np.ma.array(np.full((sim_nx, sim_nx), float(flow_speed)), mask=inside)
+        no_flow_u = np.ma.array(np.full((sim_nx, sim_nx), float(flow_speed)), mask=inside)
+        no_flow_v = np.ma.array(np.zeros((sim_nx, sim_nx)), mask=inside)
 
-        no_flow_img = _render_airfoil_image(
-            body_xy,
-            no_flow_speed,
-            output_size=output_size,
-            vmax=vmax,
-            cmap_name=cmap_name,
-        )
-        flow_img = _render_airfoil_image(
-            body_xy,
-            speed,
-            output_size=output_size,
-            vmax=vmax,
-            cmap_name=cmap_name,
-            stream_u=u,
-            stream_v=v,
-            stream_density=stream_density,
-            stream_linewidth=stream_linewidth,
-            stream_arrowsize=stream_arrowsize,
-        )
+        if color_mode == "viridis":
+            no_flow_img = _render_airfoil_image(
+                body_xy,
+                no_flow_speed,
+                output_size=output_size,
+                vmin=vmin,
+                vmax=vmax,
+                cmap_name=cmap_name,
+            )
+            flow_img = _render_airfoil_image(
+                body_xy,
+                speed,
+                output_size=output_size,
+                vmin=vmin,
+                vmax=vmax,
+                cmap_name=cmap_name,
+            )
+        elif color_mode == "rgb":
+            no_flow_img = _render_airfoil_rgb_image(
+                body_xy,
+                no_flow_u,
+                no_flow_v,
+                no_flow_speed,
+                inside,
+                output_size=output_size,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            flow_img = _render_airfoil_rgb_image(
+                body_xy,
+                u,
+                v,
+                speed,
+                inside,
+                output_size=output_size,
+                vmin=vmin,
+                vmax=vmax,
+            )
+        else:
+            raise ValueError("airfoil color_mode must be 'viridis' or 'rgb'.")
         params = {
             "seed": seed,
             "pde": "airfoil",
@@ -330,10 +381,57 @@ def generate_airfoil_image_pairs(
             "x_stretch": x_stretch,
             "y_stretch": y_stretch,
             "flow_speed": flow_speed,
-            "speed_vmin": 0.0,
+            "color_mode": color_mode,
+            "speed_vmin": vmin,
             "speed_vmax": vmax,
-            "stream_density": stream_density,
+            "speed_normalization": "fixed_clip",
         }
+        if color_mode == "rgb":
+            params["rgb_channels"] = "R=(clip(speed,vmin,vmax)-vmin)/(vmax-vmin), G=(unit_u+1)/2, B=(unit_v+1)/2"
         pairs.append((flow_img, no_flow_img, params))
 
     return pairs
+
+
+def _generate_one_airfoil_image_pair(task):
+    seed, kwargs = task
+    return generate_airfoil_image_pairs([seed], **kwargs)[0]
+
+
+def generate_airfoil_image_pairs_parallel(
+    seeds,
+    num_workers=0,
+    worker_chunksize=4,
+    progress=False,
+    progress_desc=None,
+    **kwargs,
+):
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("seeds must contain at least one seed")
+
+    if num_workers is None or int(num_workers) <= 0:
+        num_workers = min(os.cpu_count() or 1, 8, len(seeds))
+    else:
+        num_workers = min(int(num_workers), len(seeds))
+
+    if num_workers <= 1:
+        pairs = []
+        iterator = seeds
+        if progress:
+            from tqdm.auto import tqdm
+
+            iterator = tqdm(iterator, desc=progress_desc or "Airfoil sims", leave=True)
+        for seed in iterator:
+            pairs.append(generate_airfoil_image_pairs([seed], **kwargs)[0])
+        return pairs
+
+    tasks = [(seed, kwargs) for seed in seeds]
+    chunksize = max(1, int(worker_chunksize))
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        iterator = executor.map(_generate_one_airfoil_image_pair, tasks, chunksize=chunksize)
+        if progress:
+            from tqdm.auto import tqdm
+
+            iterator = tqdm(iterator, total=len(seeds), desc=progress_desc or "Airfoil sims", leave=True)
+        return list(iterator)

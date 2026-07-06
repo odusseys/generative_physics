@@ -59,6 +59,11 @@ class TrainingConfig:
     airfoil_x_stretch: float = 1.8
     airfoil_y_stretch: float = 0.55
     airfoil_flow_speed: float = 1.0
+    airfoil_color_mode: str = "rgb"
+    airfoil_speed_vmin: float = 0.5
+    airfoil_speed_vmax: float = 2.1
+    airfoil_num_workers: int = 0
+    airfoil_worker_chunksize: int = 4
 
     num_train_pairs: int = 2048
     num_eval_pairs: int = 24
@@ -66,8 +71,9 @@ class TrainingConfig:
     eval_seed_offset: int = 20_000
     train_batch_size: int = 2
     grad_accum_steps: int = 2
-    max_train_steps: int = 10_000
+    max_train_steps: int = 1000
     validate_every_n_steps: int = 100
+    validation_num_images: int = 8
     loss_ema_alpha: float = 0.08
 
     learning_rate: float = 1e-4
