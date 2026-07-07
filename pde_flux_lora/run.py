@@ -67,6 +67,8 @@ def run_training(config=None):
         data_grid_size = config.fourier_grid_size
     elif config.pde_kind == "airfoil":
         data_grid_size = config.airfoil_grid_size
+    elif config.pde_kind == "elliptic":
+        data_grid_size = config.elliptic_grid_size
 
     print(
         f"Generating {config.pde_name} data: sim_nx={data_grid_size}, save_steps={config.sim_save_steps}, "
@@ -97,6 +99,14 @@ def run_training(config=None):
             f"stretch=({config.airfoil_x_stretch:g}, {config.airfoil_y_stretch:g}), "
             f"U={config.airfoil_flow_speed:g}, color={config.airfoil_color_mode}, "
             f"workers={config.airfoil_num_workers or 'auto'}"
+        )
+    elif config.pde_kind == "elliptic":
+        print(
+            "Elliptic coefficients: "
+            f"fields=a20,a11,a02,a10,a01,a00,f, max_cycles={config.elliptic_max_cycles:g}, "
+            f"a={config.elliptic_a_min:g}..{config.elliptic_a_max:g}, "
+            f"reaction={config.elliptic_reaction_min:g}..{config.elliptic_reaction_max:g}, "
+            f"workers={config.elliptic_num_workers}, cache={config.elliptic_cache_dir}"
         )
     print("generating training records...")
     train_records = make_pde_records(

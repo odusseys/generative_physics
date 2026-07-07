@@ -28,6 +28,20 @@ class TrainingConfig:
     heat_diffusivity_min: float = 1e-5
     heat_diffusivity_max: float = 1e-2
 
+    elliptic_grid_size: int = 256
+    elliptic_max_cycles: float = 5.5
+    elliptic_a_min: float = 0.025
+    elliptic_a_max: float = 0.075
+    elliptic_mixed_rho: float = 0.12
+    elliptic_first_order_scale: float = 0.02
+    elliptic_reaction_min: float = 40.0
+    elliptic_reaction_max: float = 120.0
+    elliptic_solution_vmin: float = 0.0
+    elliptic_solution_vmax: float = 1.0
+    elliptic_num_workers: int = 16
+    elliptic_worker_chunksize: int = 1
+    elliptic_cache_dir: str = "/home/ubuntu/datasets/elliptic"
+
     cgl_t: float = 12.0
     cgl_domain_length: float = 128.0
     cgl_c1: float = 2.0
@@ -65,13 +79,13 @@ class TrainingConfig:
     airfoil_num_workers: int = 0
     airfoil_worker_chunksize: int = 4
 
-    num_train_pairs: int = 2048
+    num_train_pairs: int = 2048 // 2
     num_eval_pairs: int = 24
     train_seed_offset: int = 10_000
     eval_seed_offset: int = 20_000
     train_batch_size: int = 2
     grad_accum_steps: int = 2
-    max_train_steps: int = 1000
+    max_train_steps: int = 10000
     validate_every_n_steps: int = 100
     validation_num_images: int = 8
     loss_ema_alpha: float = 0.08
@@ -100,8 +114,11 @@ class TrainingConfig:
             return "Fourier Transform"
         if self.pde_kind == "airfoil":
             return "Airfoil Potential Flow"
+        if self.pde_kind == "elliptic":
+            return "Variable-Coefficient Elliptic PDE"
         raise ValueError(
-            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'fourier', or 'airfoil'."
+            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
+            "'fourier', 'airfoil', or 'elliptic'."
         )
 
     @property
@@ -124,6 +141,11 @@ class TrainingConfig:
             )
         if self.pde_kind == "airfoil":
             return "Given the no-flow airfoil image in uniform rightward flow, generate the potential-flow image."
+        if self.pde_kind == "elliptic":
+            return (
+                "Given seven 2D variable-coefficient elliptic PDE images for a20, a11, a02, a10, a01, a00, "
+                "and forcing f, generate the zero-boundary solution image."
+            )
         return f"Given the initial 1D {self.pde_name} condition image, generate the {self.pde_name} time-evolution image."
 
     @property
@@ -142,6 +164,6 @@ class TrainingConfig:
     def sim_batch_size(self) -> int:
         if self.pde_kind in {"poisson", "fourier"}:
             return 32 if torch.cuda.is_available() else 1
-        if self.pde_kind == "airfoil":
+        if self.pde_kind in {"airfoil", "elliptic"}:
             return 1
         return 256 if torch.cuda.is_available() else 1

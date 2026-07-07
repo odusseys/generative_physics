@@ -1,6 +1,4 @@
-import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
@@ -8,10 +6,11 @@ from .airfoil import generate_airfoil_image_pairs_parallel
 from .burgers import generate_burgers_image_pairs
 from .cgl import generate_cgl_image_pairs
 from .config import TrainingConfig
+from .elliptic import generate_elliptic_image_pairs_parallel
 from .fourier import generate_fourier_image_pairs
 from .heat import generate_heat_image_pairs
 from .poisson import generate_poisson_image_pairs
-from .rendering import as_numpy_rgb
+from .rendering import rgb_image_to_model_tensor
 
 
 def make_pde_records(
@@ -36,6 +35,8 @@ def make_pde_records(
             sim_nx = config.fourier_grid_size
         elif config.pde_kind == "airfoil":
             sim_nx = config.airfoil_grid_size
+        elif config.pde_kind == "elliptic":
+            sim_nx = config.elliptic_grid_size
         else:
             sim_nx = config.sim_nx
     sim_batch_size = config.sim_batch_size if sim_batch_size is None else sim_batch_size
@@ -66,6 +67,31 @@ def make_pde_records(
         )
         for solution_img, initial_img, params in pairs:
             records.append({"initial": initial_img, "solution": solution_img, "params": params})
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
+    if config.pde_kind == "elliptic":
+        records = generate_elliptic_image_pairs_parallel(
+            seeds,
+            num_workers=config.elliptic_num_workers,
+            worker_chunksize=config.elliptic_worker_chunksize,
+            progress=True,
+            progress_desc=f"{config.pde_name} sims {seed_offset}",
+            sim_nx=sim_nx,
+            output_size=image_size,
+            max_cycles=config.elliptic_max_cycles,
+            a_min=config.elliptic_a_min,
+            a_max=config.elliptic_a_max,
+            mixed_rho=config.elliptic_mixed_rho,
+            first_order_scale=config.elliptic_first_order_scale,
+            reaction_min=config.elliptic_reaction_min,
+            reaction_max=config.elliptic_reaction_max,
+            solution_vmin=config.elliptic_solution_vmin,
+            solution_vmax=config.elliptic_solution_vmax,
+            cache_dir=config.elliptic_cache_dir,
+        )
         sim_device = torch.device(sim_device)
         if torch.cuda.is_available() and sim_device.type == "cuda":
             torch.cuda.empty_cache()
@@ -155,10 +181,14 @@ def make_pde_records(
             )
         else:
             raise ValueError(
-                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'fourier', or 'airfoil'."
+                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
+                "'fourier', 'airfoil', or 'elliptic'."
             )
 
         for pair in pairs:
+            if isinstance(pair, dict):
+                records.append(pair)
+                continue
             if len(pair) == 4:
                 solution_img, initial_img, forcing_img, params = pair
                 records.append(
@@ -180,13 +210,7 @@ def make_pde_records(
 
 
 def image_to_model_tensor(image, image_size=256):
-    array = as_numpy_rgb(image)
-    if array.shape[:2] != (image_size, image_size):
-        array = np.asarray(
-            Image.fromarray(np.ascontiguousarray(array)).resize((image_size, image_size), Image.Resampling.BICUBIC)
-        )
-    array = np.array(array, dtype=np.float32, copy=True) / 127.5 - 1.0
-    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+    return rgb_image_to_model_tensor(image, image_size=image_size)
 
 
 class PdePairDataset(Dataset):
@@ -199,11 +223,19 @@ class PdePairDataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[idx]
+        condition_images = record.get("condition_images")
+        if condition_images is None:
+            condition_images = [record["initial"]]
+            if "forcing" in record:
+                condition_images.append(record["forcing"])
+
         item = {
-            "initial_pixels": image_to_model_tensor(record["initial"], self.image_size),
+            "condition_pixels": [image_to_model_tensor(image, self.image_size) for image in condition_images],
             "target_pixels": image_to_model_tensor(record["solution"], self.image_size),
             "index": idx,
         }
+        if "initial" in record:
+            item["initial_pixels"] = image_to_model_tensor(record["initial"], self.image_size)
         if "forcing" in record:
             item["forcing_pixels"] = image_to_model_tensor(record["forcing"], self.image_size)
         if "thermal_diffusivity" in record["params"]:

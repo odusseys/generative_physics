@@ -3,3 +3,6 @@ navier/autoreg_lora_outputs/
 dbnFiles.zip
 dbnFiles/
 **/wandb
+**/*.safetensors
+**/*.pt
+**/*.pth

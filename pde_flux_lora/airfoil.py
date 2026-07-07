@@ -1,4 +1,3 @@
-import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 
@@ -9,128 +8,17 @@ from PIL import Image, ImageDraw
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import spsolve
 
-
-def evaluate_cubic_bezier_segment(p0, p1, p2, p3, samples, endpoint=False):
-    t = np.linspace(0.0, 1.0, int(samples) + int(endpoint))
-    if not endpoint:
-        t = t[:-1]
-    t = t[:, None]
-    omt = 1.0 - t
-    return omt**3 * p0 + 3.0 * omt**2 * t * p1 + 3.0 * omt * t**2 * p2 + t**3 * p3
+from .bezier import generate_random_bezier_curve
+from .colorization import cyclic_value_colorize
 
 
-def evaluate_closed_bezier_spline(anchors, samples_per_segment=24, handle_scale=0.12):
-    if anchors.ndim != 2 or anchors.shape[1] != 2:
-        raise ValueError("anchors must have shape (points, 2)")
-    if anchors.shape[0] < 3:
-        raise ValueError("at least three anchors are required for a closed curve")
-
-    pieces = []
-    point_count = anchors.shape[0]
-    for idx in range(point_count):
-        p_prev = anchors[(idx - 1) % point_count]
-        p0 = anchors[idx]
-        p3 = anchors[(idx + 1) % point_count]
-        p_next = anchors[(idx + 2) % point_count]
-        c1 = p0 + float(handle_scale) * (p3 - p_prev)
-        c2 = p3 - float(handle_scale) * (p_next - p0)
-        pieces.append(evaluate_cubic_bezier_segment(p0, c1, c2, p3, samples_per_segment))
-
-    curve = np.concatenate(pieces, axis=0)
-    return np.concatenate((curve, curve[:1]), axis=0)
-
-
-def _orientation(a, b, c):
-    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-
-
-def _segments_intersect(a, b, c, d, eps=1e-9):
-    if (
-        max(float(a[0]), float(b[0])) + eps < min(float(c[0]), float(d[0]))
-        or max(float(c[0]), float(d[0])) + eps < min(float(a[0]), float(b[0]))
-        or max(float(a[1]), float(b[1])) + eps < min(float(c[1]), float(d[1]))
-        or max(float(c[1]), float(d[1])) + eps < min(float(a[1]), float(b[1]))
-    ):
-        return False
-
-    def on_segment(p, q, r):
-        return (
-            min(float(p[0]), float(r[0])) - eps <= float(q[0]) <= max(float(p[0]), float(r[0])) + eps
-            and min(float(p[1]), float(r[1])) - eps <= float(q[1]) <= max(float(p[1]), float(r[1])) + eps
-        )
-
-    o1 = _orientation(a, b, c)
-    o2 = _orientation(a, b, d)
-    o3 = _orientation(c, d, a)
-    o4 = _orientation(c, d, b)
-
-    if o1 * o2 < -eps and o3 * o4 < -eps:
-        return True
-    if abs(o1) <= eps and on_segment(a, c, b):
-        return True
-    if abs(o2) <= eps and on_segment(a, d, b):
-        return True
-    if abs(o3) <= eps and on_segment(c, a, d):
-        return True
-    if abs(o4) <= eps and on_segment(c, b, d):
-        return True
-    return False
-
-
-def polyline_self_intersects(points, closed=True):
-    segment_count = points.shape[0] - 1
-    for i in range(segment_count):
-        for j in range(i + 1, segment_count):
-            if abs(i - j) <= 1:
-                continue
-            if closed and i == 0 and j == segment_count - 1:
-                continue
-            if _segments_intersect(points[i], points[i + 1], points[j], points[j + 1]):
-                return True
-    return False
-
-
-def generate_random_bezier_curve(
-    min_points=5,
-    max_points=10,
-    samples_per_segment=28,
-    seed=None,
-    handle_scale=0.12,
-    max_tries=300,
-):
-    if min_points < 3:
-        raise ValueError("min_points must be at least 3")
-    if max_points < min_points:
-        raise ValueError("max_points must be >= min_points")
-
-    rng = np.random.default_rng(seed)
-    two_pi = 2.0 * math.pi
-
-    for _ in range(int(max_tries)):
-        point_count = int(rng.integers(min_points, max_points + 1))
-        angles = np.sort(rng.random(point_count) * two_pi)
-        wrapped_angles = np.concatenate((angles, angles[:1] + two_pi))
-        if np.diff(wrapped_angles).min() < 0.08:
-            continue
-
-        radii = rng.uniform(0.35, 0.95, size=point_count)
-        anchors = np.stack((radii * np.cos(angles), radii * np.sin(angles)), axis=1)
-        anchors = anchors - anchors.mean(axis=0, keepdims=True)
-
-        curve = evaluate_closed_bezier_spline(
-            anchors,
-            samples_per_segment=samples_per_segment,
-            handle_scale=handle_scale,
-        )
-
-        scale = 0.92 / max(np.abs(curve).max(), 1e-6)
-        anchors = anchors * scale
-        curve = curve * scale
-
-        if np.linalg.norm(curve[0] - curve[-1]) <= 1e-6 and not polyline_self_intersects(curve):
-            return anchors, curve
-
-    raise RuntimeError("could not sample a closed non-self-intersecting Bezier curve")
+AIRFOIL_BASE_COLORS = (
+    (0.18, 0.78, 1.00),
+    (0.10, 0.30, 0.95),
+    (0.64, 0.20, 0.86),
+    (1.00, 0.34, 0.26),
+    (1.00, 0.84, 0.22),
+)
 
 
 def fit_curve_to_centered_square(curve, n=256, box=None, x_stretch=1.8, y_stretch=0.55):
@@ -255,27 +143,39 @@ def _resize_and_outline_airfoil(rgb, body_xy, sim_nx, output_size, outline_width
     return np.asarray(image.convert("RGB")).copy()
 
 
-def _render_airfoil_rgb_image(body_xy, u, v, speed, inside, output_size=256, vmin=0.5, vmax=None):
+def _render_airfoil_rgb_image(
+    body_xy,
+    u,
+    v,
+    speed,
+    inside,
+    output_size=256,
+    vmin=0.5,
+    vmax=None,
+    base_colors=AIRFOIL_BASE_COLORS,
+    gamma=0.55,
+):
     sim_nx = speed.shape[0]
     vmin = float(vmin)
-    vmax = float(vmax)
-    span = max(vmax - vmin, 1e-6)
-
     speed_arr = np.asarray(np.ma.filled(speed, 0.0), dtype=np.float32)
-    speed_magnitude = np.clip(speed_arr, vmin, vmax)
+    if vmax is None:
+        vmax = max(float(np.percentile(speed_arr[~inside], 99.0)), vmin + 1e-6)
+    vmax = float(vmax)
     u_arr = np.asarray(np.ma.filled(u, 0.0), dtype=np.float32)
     v_arr = np.asarray(np.ma.filled(v, 0.0), dtype=np.float32)
-    speed_safe = np.maximum(speed_arr, 1e-6)
-    unit_u = np.where(speed_arr > 1e-6, u_arr / speed_safe, 0.0)
-    unit_v = np.where(speed_arr > 1e-6, v_arr / speed_safe, 0.0)
 
-    rgb = np.empty((sim_nx, sim_nx, 3), dtype=np.float32)
-    rgb[..., 0] = (speed_magnitude - vmin) / span
-    rgb[..., 1] = np.clip(0.5 * (unit_u + 1.0), 0.0, 1.0)
-    rgb[..., 2] = np.clip(0.5 * (unit_v + 1.0), 0.0, 1.0)
-    rgb[inside] = 1.0
-
-    rgb_uint8 = np.flipud((rgb * 255.0).round().astype(np.uint8))
+    phase = (np.arctan2(v_arr, u_arr) + 2.0 * np.pi) / (2.0 * np.pi)
+    rgb_uint8 = cyclic_value_colorize(
+        phase,
+        speed_arr,
+        base_colors=base_colors,
+        value_vmin=vmin,
+        value_vmax=vmax,
+        gamma=gamma,
+        mask=inside,
+        mask_color=(1.0, 1.0, 1.0),
+    )
+    rgb_uint8 = np.flipud(rgb_uint8)
     return _resize_and_outline_airfoil(rgb_uint8, body_xy, sim_nx=sim_nx, output_size=output_size)
 
 
@@ -295,6 +195,8 @@ def generate_airfoil_image_pairs(
     speed_vmax=2.1,
     cmap_name="viridis",
     color_mode="viridis",
+    rgb_base_colors=AIRFOIL_BASE_COLORS,
+    rgb_gamma=0.55,
 ):
     seeds = list(seeds)
     if not seeds:
@@ -355,6 +257,8 @@ def generate_airfoil_image_pairs(
                 output_size=output_size,
                 vmin=vmin,
                 vmax=vmax,
+                base_colors=rgb_base_colors,
+                gamma=rgb_gamma,
             )
             flow_img = _render_airfoil_rgb_image(
                 body_xy,
@@ -365,6 +269,8 @@ def generate_airfoil_image_pairs(
                 output_size=output_size,
                 vmin=vmin,
                 vmax=vmax,
+                base_colors=rgb_base_colors,
+                gamma=rgb_gamma,
             )
         else:
             raise ValueError("airfoil color_mode must be 'viridis' or 'rgb'.")
@@ -387,7 +293,9 @@ def generate_airfoil_image_pairs(
             "speed_normalization": "fixed_clip",
         }
         if color_mode == "rgb":
-            params["rgb_channels"] = "R=(clip(speed,vmin,vmax)-vmin)/(vmax-vmin), G=(unit_u+1)/2, B=(unit_v+1)/2"
+            params["rgb_base_colors"] = tuple(tuple(float(x) for x in color) for color in rgb_base_colors)
+            params["rgb_gamma"] = float(rgb_gamma)
+            params["rgb_channels"] = "cyclic flow direction color, brightness=clip(speed,vmin,vmax)^gamma"
         pairs.append((flow_img, no_flow_img, params))
 
     return pairs

@@ -6,12 +6,12 @@ import torch.nn.functional as F
 from diffusers import Flux2KleinPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu, retrieve_timesteps
 
-from .rendering import as_pil_image
+from .rendering import image_size_xy, rgb_image_to_model_tensor
 
 
 def flux2_klein_lora_targets(transformer):
     n_single = len(transformer.single_transformer_blocks)
-    return ["to_k", "to_q", "to_v", "to_out.0", "to_qkv_mlp_proj"] + [
+    return ["to_k", "to_q", "to_v", "to_out.0", "to_qkv_mlp_proj", "linear_in", "linear_out"] + [
         f"single_transformer_blocks.{i}.attn.to_out" for i in range(min(24, n_single))
     ]
 
@@ -76,18 +76,26 @@ def sample_exact_distilled_training_step(scheduler, image_seq_len, batch_size, l
 
 
 def pde_lora_loss(pipe, batch, prompt_embeds, text_ids, device, num_inference_steps=4, print_schedule=False):
-    initial_pixels = batch["initial_pixels"].to(device=device, dtype=pipe.vae.dtype)
-    forcing_pixels = batch.get("forcing_pixels")
-    if forcing_pixels is not None:
-        forcing_pixels = forcing_pixels.to(device=device, dtype=pipe.vae.dtype)
+    condition_pixel_batches = batch.get("condition_pixels")
+    if condition_pixel_batches is None:
+        condition_pixel_batches = [batch["initial_pixels"]]
+        forcing_pixels = batch.get("forcing_pixels")
+        if forcing_pixels is not None:
+            condition_pixel_batches.append(forcing_pixels)
+    elif torch.is_tensor(condition_pixel_batches):
+        condition_pixel_batches = [condition_pixel_batches]
+    else:
+        condition_pixel_batches = list(condition_pixel_batches)
+
     target_pixels = batch["target_pixels"].to(device=device, dtype=pipe.vae.dtype)
     batch_size = target_pixels.shape[0]
 
     with torch.no_grad():
         target_latents = encode_flux2_latents(pipe, target_pixels, device=device)
-        condition_latents = [encode_flux2_latents(pipe, initial_pixels, device=device)]
-        if forcing_pixels is not None:
-            condition_latents.append(encode_flux2_latents(pipe, forcing_pixels, device=device))
+        condition_latents = [
+            encode_flux2_latents(pipe, pixels.to(device=device, dtype=pipe.vae.dtype), device=device)
+            for pixels in condition_pixel_batches
+        ]
 
     target_ids = Flux2KleinPipeline._prepare_latent_ids(target_latents).to(device)
     condition_ids = (
@@ -153,29 +161,30 @@ def infer_solution(
     seed=0,
     thermal_diffusivity=None,
     forcing_image=None,
+    condition_images=None,
 ):
-    initial_image = as_pil_image(initial_image)
-    if forcing_image is not None:
-        forcing_image = as_pil_image(forcing_image)
+    if condition_images is None:
+        condition_images = [initial_image]
+        if forcing_image is not None:
+            condition_images.append(forcing_image)
+    condition_images = [image for image in condition_images if image is not None]
+    if not condition_images:
+        raise ValueError("infer_solution requires at least one condition image.")
+
     generator = torch.Generator(device=device).manual_seed(seed)
     was_training = pipe.transformer.training
     pipe.transformer.eval()
 
     multiple_of = pipe.vae_scale_factor * 2
-    condition_images = []
-    for image in [initial_image, forcing_image]:
-        if image is None:
-            continue
-        image_width, image_height = image.size
+    preprocessed_condition_images = []
+    for image in condition_images:
+        image_width, image_height = image_size_xy(image)
         image_width = (image_width // multiple_of) * multiple_of
         image_height = (image_height // multiple_of) * multiple_of
-        condition_images.append(
-            pipe.image_processor.preprocess(
-                image,
-                height=image_height,
-                width=image_width,
-                resize_mode="crop",
-            )
+        if image_width <= 0 or image_height <= 0:
+            raise ValueError("condition images are too small for the VAE scale factor.")
+        preprocessed_condition_images.append(
+            rgb_image_to_model_tensor(image, image_size=(image_height, image_width)).unsqueeze(0)
         )
 
     prompt_embeds = prompt_embeds.to(device=device, dtype=pipe.transformer.dtype)
@@ -191,7 +200,7 @@ def infer_solution(
         generator=generator,
     )
     image_latents, image_latent_ids = pipe.prepare_image_latents(
-        images=condition_images,
+        images=preprocessed_condition_images,
         batch_size=1,
         generator=generator,
         device=device,

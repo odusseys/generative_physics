@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from matplotlib import colormaps
 from PIL import Image
 
@@ -125,10 +126,56 @@ def as_numpy_rgb(image):
             array = array[..., :3]
 
     if array.dtype != np.uint8:
+        if array.dtype == np.uint16:
+            return np.round(array.astype(np.float32) / 257.0).clip(0, 255).astype(np.uint8)
         if np.issubdtype(array.dtype, np.floating) and (array.size == 0 or float(np.nanmax(array)) <= 1.0):
             array = np.clip(array * 255.0, 0.0, 255.0)
         array = np.clip(array, 0, 255).astype(np.uint8)
     return array
+
+
+def as_float_rgb(image):
+    if isinstance(image, Image.Image):
+        return np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+
+    array = np.asarray(image)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=-1)
+    elif array.shape[-1] == 4:
+        array = array[..., :3]
+
+    if array.dtype == np.uint8:
+        return array.astype(np.float32) / 255.0
+    if array.dtype == np.uint16:
+        return array.astype(np.float32) / 65535.0
+    if np.issubdtype(array.dtype, np.integer):
+        return array.astype(np.float32) / float(np.iinfo(array.dtype).max)
+
+    array = array.astype(np.float32, copy=False)
+    if array.size and float(np.nanmax(array)) > 1.0:
+        array = array / 255.0
+    return np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def resize_float_rgb(array, size):
+    if isinstance(size, int):
+        size = (size, size)
+    height, width = size
+    array = np.asarray(array, dtype=np.float32)
+    if array.shape[:2] == (height, width):
+        return array
+
+    tensor = torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1).unsqueeze(0)
+    resized = F.interpolate(tensor, size=(height, width), mode="bicubic", align_corners=False)
+    return resized.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).numpy()
+
+
+def rgb_image_to_model_tensor(image, image_size=None):
+    array = as_float_rgb(image)
+    if image_size is not None:
+        array = resize_float_rgb(array, image_size)
+    array = np.array(array, dtype=np.float32, copy=True)
+    return torch.from_numpy(array).permute(2, 0, 1).mul(2.0).sub(1.0).contiguous()
 
 
 def as_pil_image(image):
