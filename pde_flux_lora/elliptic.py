@@ -1,6 +1,5 @@
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +26,18 @@ COLOR_RAMPS = dict(
     )
 )
 DEFAULT_CACHE_DIR = Path("/home/ubuntu/datasets/elliptic")
-ELLIPTIC_CACHE_VERSION = 3
+ELLIPTIC_CACHE_VERSION = 5
+ELLIPTIC_MAX_CYCLES = 5.5
+# These ranges make the lower-order and mixed coefficients visible in the
+# solution while keeping the reaction-coupled forcing in a common [0, 1] scale.
+ELLIPTIC_A_MIN = 0.015
+ELLIPTIC_A_MAX = 0.12
+ELLIPTIC_MIXED_RHO = 0.35
+ELLIPTIC_FIRST_ORDER_SCALE = 0.08
+ELLIPTIC_REACTION_MIN = 0.5
+ELLIPTIC_REACTION_MAX = 10.0
+ELLIPTIC_SOLUTION_VMIN = 0.0
+ELLIPTIC_SOLUTION_VMAX = 1.0
 
 
 def make_frequency_grid(L):
@@ -44,7 +54,7 @@ def normalize01(x, rng):
     return (x - lo) / (hi - lo)
 
 
-def bandwidth_field(L, rng, m, R, max_cycles=5.5):
+def bandwidth_field(L, rng, m, R, max_cycles=ELLIPTIC_MAX_CYCLES):
     if m <= 1e-12:
         return np.full((L, L), rng.random(), dtype=np.float32)
     z = rng.random((L, L), dtype=np.float32)
@@ -55,20 +65,20 @@ def bandwidth_field(L, rng, m, R, max_cycles=5.5):
     return normalize01(x, rng).astype(np.float32)
 
 
-def signed_bandwidth_field(L, rng, m, R, max_cycles=5.5):
+def signed_bandwidth_field(L, rng, m, R, max_cycles=ELLIPTIC_MAX_CYCLES):
     return 2.0 * bandwidth_field(L, rng, m, R, max_cycles) - 1.0
 
 
 def generate_elliptic_pde_data(
     L,
     seed,
-    max_cycles=5.5,
-    a_min=0.025,
-    a_max=0.075,
-    mixed_rho=0.12,
-    first_order_scale=0.02,
-    reaction_min=40.0,
-    reaction_max=120.0,
+    max_cycles=ELLIPTIC_MAX_CYCLES,
+    a_min=ELLIPTIC_A_MIN,
+    a_max=ELLIPTIC_A_MAX,
+    mixed_rho=ELLIPTIC_MIXED_RHO,
+    first_order_scale=ELLIPTIC_FIRST_ORDER_SCALE,
+    reaction_min=ELLIPTIC_REACTION_MIN,
+    reaction_max=ELLIPTIC_REACTION_MAX,
 ):
     rng = np.random.default_rng(seed)
     R = make_frequency_grid(L)
@@ -363,15 +373,15 @@ def generate_elliptic_image_pairs(
     seeds,
     sim_nx=256,
     output_size=256,
-    max_cycles=5.5,
-    a_min=0.025,
-    a_max=0.075,
-    mixed_rho=0.12,
-    first_order_scale=0.02,
-    reaction_min=40.0,
-    reaction_max=120.0,
-    solution_vmin=0.0,
-    solution_vmax=1.0,
+    max_cycles=ELLIPTIC_MAX_CYCLES,
+    a_min=ELLIPTIC_A_MIN,
+    a_max=ELLIPTIC_A_MAX,
+    mixed_rho=ELLIPTIC_MIXED_RHO,
+    first_order_scale=ELLIPTIC_FIRST_ORDER_SCALE,
+    reaction_min=ELLIPTIC_REACTION_MIN,
+    reaction_max=ELLIPTIC_REACTION_MAX,
+    solution_vmin=ELLIPTIC_SOLUTION_VMIN,
+    solution_vmax=ELLIPTIC_SOLUTION_VMAX,
     cache_dir=DEFAULT_CACHE_DIR,
 ):
     seeds = list(seeds)
@@ -438,44 +448,3 @@ def generate_elliptic_image_pairs(
             )
         )
     return records
-
-
-def _generate_one_elliptic_image_pair(task):
-    seed, kwargs = task
-    return generate_elliptic_image_pairs([seed], **kwargs)[0]
-
-
-def generate_elliptic_image_pairs_parallel(
-    seeds,
-    num_workers=16,
-    worker_chunksize=1,
-    progress=False,
-    progress_desc=None,
-    **kwargs,
-):
-    seeds = list(seeds)
-    if not seeds:
-        raise ValueError("seeds must contain at least one seed")
-
-    if num_workers is None or int(num_workers) <= 0:
-        num_workers = min(os.cpu_count() or 1, 16, len(seeds))
-    else:
-        num_workers = min(int(num_workers), len(seeds))
-
-    if num_workers <= 1:
-        iterator = seeds
-        if progress:
-            from tqdm.auto import tqdm
-
-            iterator = tqdm(iterator, desc=progress_desc or "Elliptic sims", leave=True)
-        return [generate_elliptic_image_pairs([seed], **kwargs)[0] for seed in iterator]
-
-    tasks = [(seed, kwargs) for seed in seeds]
-    chunksize = max(1, int(worker_chunksize))
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        iterator = executor.map(_generate_one_elliptic_image_pair, tasks, chunksize=chunksize)
-        if progress:
-            from tqdm.auto import tqdm
-
-            iterator = tqdm(iterator, total=len(seeds), desc=progress_desc or "Elliptic sims", leave=True)
-        return list(iterator)

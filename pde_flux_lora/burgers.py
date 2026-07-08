@@ -6,16 +6,17 @@ from .numerics import downsample_solution_torch, periodic_linear_upsample_1d
 from .rendering import repeat_rgb_row_view, scalar_to_rgb_uint8_torch
 
 
-def solve_hard_burgers(nx=1024, T=0.8, nu=1e-4, num_modes=50, scale=1.0, seed=None, cfl=0.35, save_steps=256):
+def solve_hard_burgers(nx=1024, T=0.8, nu=1e-4, num_modes=24, scale=1.0, seed=None, cfl=0.35, save_steps=256):
     rng = np.random.default_rng(seed)
     x = np.linspace(0, 1, nx, endpoint=False)
     dx = 1.0 / nx
 
-    amps = rng.normal(size=num_modes) / np.arange(1, num_modes + 1)
-    phases = rng.uniform(0, 2 * np.pi, size=num_modes)
+    active_modes = int(rng.integers(1, int(num_modes) + 1))
+    amps = rng.normal(size=active_modes) / np.arange(1, active_modes + 1)
+    phases = rng.uniform(0, 2 * np.pi, size=active_modes)
 
     u = np.zeros_like(x)
-    for k, a, p in zip(range(1, num_modes + 1), amps, phases):
+    for k, a, p in zip(range(1, active_modes + 1), amps, phases):
         u += a * np.sin(2 * np.pi * k * x + p)
     u = scale * u / (np.std(u) + 1e-12)
 
@@ -85,21 +86,32 @@ def solve_hard_burgers(nx=1024, T=0.8, nu=1e-4, num_modes=50, scale=1.0, seed=No
 
 
 def _burgers_initial_batch(seeds, nx, num_modes, scale, device, dtype=torch.float32):
+    if num_modes < 1:
+        raise ValueError("burgers num_modes must be at least 1.")
+
     seeds = list(seeds)
     x = torch.arange(nx, device=device, dtype=dtype) / nx
     k = torch.arange(1, num_modes + 1, device=device, dtype=dtype)
     denom = np.arange(1, num_modes + 1, dtype=np.float32)
     amps = []
     phases = []
+    mode_counts = []
     for seed in seeds:
         rng = np.random.default_rng(seed)
-        amps.append((rng.normal(size=num_modes).astype(np.float32) / denom)[None, :])
-        phases.append(rng.uniform(0, 2 * np.pi, size=num_modes).astype(np.float32)[None, :])
+        active_modes = int(rng.integers(1, int(num_modes) + 1))
+        amp = np.zeros(int(num_modes), dtype=np.float32)
+        phase = np.zeros(int(num_modes), dtype=np.float32)
+        amp[:active_modes] = rng.normal(size=active_modes).astype(np.float32) / denom[:active_modes]
+        phase[:active_modes] = rng.uniform(0, 2 * np.pi, size=active_modes).astype(np.float32)
+        amps.append(amp[None, :])
+        phases.append(phase[None, :])
+        mode_counts.append(active_modes)
     amps = torch.as_tensor(np.concatenate(amps, axis=0), device=device, dtype=dtype)
     phases = torch.as_tensor(np.concatenate(phases, axis=0), device=device, dtype=dtype)
+    mode_counts = torch.as_tensor(mode_counts, device=device, dtype=torch.long)
     angles = 2 * torch.pi * k[None, :, None] * x[None, None, :] + phases[:, :, None]
     u = (amps[:, :, None] * torch.sin(angles)).sum(dim=1)
-    return x, scale * u / (u.std(dim=-1, keepdim=True, unbiased=False) + 1e-12)
+    return x, scale * u / (u.std(dim=-1, keepdim=True, unbiased=False) + 1e-12), mode_counts
 
 
 def _weno5_left_torch(v, eps=1e-6):
@@ -166,9 +178,9 @@ def _get_burgers_step_fn(device, dtype, use_compile=True):
 def solve_hard_burgers_batch_torch(
     seeds,
     nx=2048,
-    T=0.5,
+    T=0.15,
     nu=3e-5,
-    num_modes=64,
+    num_modes=24,
     scale=1.5,
     cfl=0.35,
     save_steps=256,
@@ -189,7 +201,9 @@ def solve_hard_burgers_batch_torch(
         raise ValueError("seeds must contain at least one seed")
 
     initial_grid_size = int(initial_grid_size or nx)
-    _, u_initial = _burgers_initial_batch(seeds, initial_grid_size, num_modes, scale, device=device, dtype=dtype)
+    _, u_initial, mode_counts = _burgers_initial_batch(
+        seeds, initial_grid_size, num_modes, scale, device=device, dtype=dtype
+    )
     u = periodic_linear_upsample_1d(u_initial, nx)
     x = torch.arange(nx, device=device, dtype=dtype) / nx
     dx = 1.0 / nx
@@ -246,7 +260,7 @@ def solve_hard_burgers_batch_torch(
         pbar.close()
 
     if return_initial_grid:
-        return x.detach().cpu().numpy(), save_t_cpu, U, u_initial
+        return x.detach().cpu().numpy(), save_t_cpu, U, u_initial, mode_counts
     return x.detach().cpu().numpy(), save_t_cpu, U
 
 
@@ -255,9 +269,9 @@ def generate_burgers_image_pairs(
     sim_nx=2048,
     output_size=512,
     initial_grid_size=None,
-    T=0.5,
+    T=0.15,
     nu=3e-5,
-    num_modes=64,
+    num_modes=24,
     scale=1.5,
     save_steps=512,
     cfl=0.35,
@@ -272,7 +286,7 @@ def generate_burgers_image_pairs(
 ):
     seeds = list(seeds)
     initial_grid_size = int(initial_grid_size or output_size)
-    _, _, U, u_initial = solve_hard_burgers_batch_torch(
+    _, _, U, u_initial, mode_counts = solve_hard_burgers_batch_torch(
         seeds=seeds,
         nx=sim_nx,
         T=T,
@@ -303,10 +317,13 @@ def generate_burgers_image_pairs(
         .numpy()
     )
     bound = bound.detach().cpu().numpy()
+    mode_counts = mode_counts.detach().cpu().numpy()
     del U, U_img, u_initial, u0_img
 
     pairs = []
-    for seed, solution_img, initial_row, bound_i in zip(seeds, solution_rgb, initial_row_rgb, bound):
+    for seed, solution_img, initial_row, bound_i, active_modes in zip(
+        seeds, solution_rgb, initial_row_rgb, bound, mode_counts
+    ):
         params = {
             "seed": seed,
             "sim_nx": sim_nx,
@@ -315,6 +332,7 @@ def generate_burgers_image_pairs(
             "T": T,
             "nu": nu,
             "num_modes": num_modes,
+            "active_modes": int(active_modes),
             "scale": scale,
             "vmin": -float(bound_i),
             "vmax": float(bound_i),

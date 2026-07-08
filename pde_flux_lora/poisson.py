@@ -5,6 +5,11 @@ from .numerics import downsample_solution_torch
 from .rendering import scalar_to_rgb_uint8_torch
 
 
+POISSON_NUM_GAUSSIAN_MODES = 12
+POISSON_SOURCE_SCALE = 1.0
+POISSON_SOLUTION_VMAX = 0.05
+
+
 def _dst_i(x, dim=-1):
     n = x.shape[dim]
     zeros_shape = list(x.shape)
@@ -51,8 +56,8 @@ def _poisson_source_batch(
 def solve_poisson_batch_torch(
     seeds,
     grid_size=256,
-    num_gaussian_modes=12,
-    source_scale=1.0,
+    num_gaussian_modes=POISSON_NUM_GAUSSIAN_MODES,
+    source_scale=POISSON_SOURCE_SCALE,
     sim_device=None,
     dtype=torch.float32,
 ):
@@ -91,9 +96,9 @@ def generate_poisson_image_pairs(
     seeds,
     sim_nx=256,
     output_size=256,
-    num_gaussian_modes=12,
-    source_scale=1.0,
-    solution_vmax=0.05,
+    num_gaussian_modes=POISSON_NUM_GAUSSIAN_MODES,
+    source_scale=POISSON_SOURCE_SCALE,
+    solution_vmax=POISSON_SOLUTION_VMAX,
     cmap_name="viridis",
     sim_device=None,
 ):

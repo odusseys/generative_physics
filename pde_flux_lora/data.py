@@ -1,16 +1,66 @@
+import os
+from concurrent.futures import ProcessPoolExecutor
+
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from tqdm.auto import tqdm
 
-from .airfoil import generate_airfoil_image_pairs_parallel
+from .airfoil import generate_airfoil_image_pairs
 from .burgers import generate_burgers_image_pairs
 from .cgl import generate_cgl_image_pairs
 from .config import TrainingConfig
-from .elliptic import generate_elliptic_image_pairs_parallel
+from .elliptic import generate_elliptic_image_pairs
+from .eikonal import generate_eikonal_image_pairs
+from .elasticity import generate_elasticity_image_pairs
 from .fourier import generate_fourier_image_pairs
+from .fracture import generate_fracture_image_pairs
 from .heat import generate_heat_image_pairs
+from .ot import generate_ot_image_pairs
 from .poisson import generate_poisson_image_pairs
 from .rendering import rgb_image_to_model_tensor
+
+
+CPU_ONLY_PDE_KINDS = {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture"}
+
+
+def simulations_run_on_cpu(config=None, sim_device=None):
+    config = config or TrainingConfig()
+    if config.pde_kind in CPU_ONLY_PDE_KINDS:
+        return True
+    sim_device = torch.device(sim_device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    return sim_device.type == "cpu"
+
+
+def cpu_sim_worker_count(config=None, num_pairs=None):
+    config = config or TrainingConfig()
+    requested = max(0, int(getattr(config, "sim_num_workers", 0)))
+    if requested == 0:
+        return 0
+    available = os.cpu_count() or requested
+    count = min(requested, available)
+    if num_pairs is not None:
+        count = min(count, max(0, int(num_pairs)))
+    return count
+
+
+def simulation_grid_size(config):
+    if config.pde_kind == "poisson":
+        return config.poisson_grid_size
+    if config.pde_kind == "fourier":
+        return config.fourier_grid_size
+    if config.pde_kind == "airfoil":
+        return config.airfoil_grid_size
+    if config.pde_kind == "elliptic":
+        return config.elliptic_grid_size
+    if config.pde_kind == "elasticity":
+        return config.elasticity_grid_size
+    if config.pde_kind == "eikonal":
+        return config.eikonal_grid_size
+    if config.pde_kind == "ot":
+        return config.ot_solve_grid_size
+    if config.pde_kind == "fracture":
+        return config.fracture_grid_size
+    return config.sim_nx
 
 
 def make_pde_records(
@@ -23,47 +73,25 @@ def make_pde_records(
     sim_batch_size=None,
     sim_device=None,
     config=None,
+    progress=True,
+    use_cache=True,
 ):
     config = config or TrainingConfig()
     image_size = config.output_image_size if image_size is None else image_size
     initial_grid_size = config.initial_grid_size if initial_grid_size is None else initial_grid_size
     save_steps = config.sim_save_steps if save_steps is None else save_steps
     if sim_nx is None:
-        if config.pde_kind == "poisson":
-            sim_nx = config.poisson_grid_size
-        elif config.pde_kind == "fourier":
-            sim_nx = config.fourier_grid_size
-        elif config.pde_kind == "airfoil":
-            sim_nx = config.airfoil_grid_size
-        elif config.pde_kind == "elliptic":
-            sim_nx = config.elliptic_grid_size
-        else:
-            sim_nx = config.sim_nx
+        sim_nx = simulation_grid_size(config)
     sim_batch_size = config.sim_batch_size if sim_batch_size is None else sim_batch_size
     sim_device = sim_device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     records = []
     seeds = list(range(seed_offset, seed_offset + num_pairs))
     if config.pde_kind == "airfoil":
-        pairs = generate_airfoil_image_pairs_parallel(
+        pairs = generate_airfoil_image_pairs(
             seeds,
-            num_workers=config.airfoil_num_workers,
-            worker_chunksize=config.airfoil_worker_chunksize,
-            progress=True,
-            progress_desc=f"{config.pde_name} sims {seed_offset}",
             sim_nx=sim_nx,
             output_size=image_size,
-            min_points=config.airfoil_min_points,
-            max_points=config.airfoil_max_points,
-            samples_per_segment=config.airfoil_samples_per_segment,
-            handle_scale=config.airfoil_handle_scale,
-            body_box=sim_nx * config.airfoil_body_box_fraction,
-            x_stretch=config.airfoil_x_stretch,
-            y_stretch=config.airfoil_y_stretch,
-            flow_speed=config.airfoil_flow_speed,
-            speed_vmin=config.airfoil_speed_vmin,
-            speed_vmax=config.airfoil_speed_vmax,
-            color_mode=config.airfoil_color_mode,
         )
         for solution_img, initial_img, params in pairs:
             records.append({"initial": initial_img, "solution": solution_img, "params": params})
@@ -73,32 +101,71 @@ def make_pde_records(
         return records
 
     if config.pde_kind == "elliptic":
-        records = generate_elliptic_image_pairs_parallel(
+        records = generate_elliptic_image_pairs(
             seeds,
-            num_workers=config.elliptic_num_workers,
-            worker_chunksize=config.elliptic_worker_chunksize,
-            progress=True,
-            progress_desc=f"{config.pde_name} sims {seed_offset}",
             sim_nx=sim_nx,
             output_size=image_size,
-            max_cycles=config.elliptic_max_cycles,
-            a_min=config.elliptic_a_min,
-            a_max=config.elliptic_a_max,
-            mixed_rho=config.elliptic_mixed_rho,
-            first_order_scale=config.elliptic_first_order_scale,
-            reaction_min=config.elliptic_reaction_min,
-            reaction_max=config.elliptic_reaction_max,
-            solution_vmin=config.elliptic_solution_vmin,
-            solution_vmax=config.elliptic_solution_vmax,
-            cache_dir=config.elliptic_cache_dir,
+            cache_dir=config.elliptic_cache_dir if use_cache else None,
         )
         sim_device = torch.device(sim_device)
         if torch.cuda.is_available() and sim_device.type == "cuda":
             torch.cuda.empty_cache()
         return records
 
+    if config.pde_kind == "elasticity":
+        pairs = generate_elasticity_image_pairs(
+            seeds,
+            sim_nx=sim_nx,
+            output_size=image_size,
+        )
+        for solution_img, mask_img, params in pairs:
+            records.append({"initial": mask_img, "solution": solution_img, "params": params})
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
+    if config.pde_kind == "eikonal":
+        pairs = generate_eikonal_image_pairs(
+            seeds,
+            sim_nx=sim_nx,
+            output_size=image_size,
+        )
+        for solution_img, refractive_img, params in pairs:
+            records.append({"initial": refractive_img, "solution": solution_img, "params": params})
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
+    if config.pde_kind == "ot":
+        records = generate_ot_image_pairs(
+            seeds,
+            sim_nx=sim_nx,
+            output_size=image_size,
+        )
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
+    if config.pde_kind == "fracture":
+        pairs = generate_fracture_image_pairs(
+            seeds,
+            sim_nx=sim_nx,
+            output_size=image_size,
+        )
+        for solution_img, initial_img, params in pairs:
+            records.append({"initial": initial_img, "solution": solution_img, "params": params})
+        sim_device = torch.device(sim_device)
+        if torch.cuda.is_available() and sim_device.type == "cuda":
+            torch.cuda.empty_cache()
+        return records
+
     chunks = range(0, num_pairs, sim_batch_size)
-    for start in tqdm(chunks, desc=f"{config.pde_name} sims {seed_offset}", position=0, leave=True):
+    if progress:
+        chunks = tqdm(chunks, desc=f"{config.pde_name} sims {seed_offset}", position=0, leave=True)
+    for start in chunks:
         seed_chunk = seeds[start : start + sim_batch_size]
         progress_desc = f"{config.pde_kind.upper()} {seed_chunk[0]}..{seed_chunk[-1]}"
         if config.pde_kind == "heat":
@@ -108,15 +175,8 @@ def make_pde_records(
                 output_size=image_size,
                 initial_grid_size=initial_grid_size,
                 save_steps=save_steps,
-                T=config.heat_t,
-                num_modes=config.heat_num_modes,
-                scale=config.heat_scale,
-                forcing_num_modes=config.heat_forcing_num_modes,
-                forcing_scale=config.heat_forcing_scale,
-                diffusivity_min=config.heat_diffusivity_min,
-                diffusivity_max=config.heat_diffusivity_max,
                 sim_device=sim_device,
-                progress=True,
+                progress=progress,
                 progress_desc=progress_desc,
                 progress_position=1,
                 progress_update_every=config.sim_progress_update_every,
@@ -128,16 +188,8 @@ def make_pde_records(
                 output_size=image_size,
                 initial_grid_size=initial_grid_size,
                 save_steps=save_steps,
-                T=config.cgl_t,
-                domain_length=config.cgl_domain_length,
-                c1=config.cgl_c1,
-                c3=config.cgl_c3,
-                num_modes=config.cgl_num_modes,
-                amp_scale=config.cgl_amp_scale,
-                phase_scale=config.cgl_phase_scale,
-                substeps_per_frame=config.cgl_substeps_per_frame,
                 sim_device=sim_device,
-                progress=True,
+                progress=progress,
                 progress_desc=progress_desc,
                 progress_position=1,
                 progress_update_every=config.sim_progress_update_every,
@@ -152,7 +204,7 @@ def make_pde_records(
                 sim_device=sim_device,
                 adaptive_dt=config.sim_adaptive_dt,
                 compile_step=config.sim_compile_step,
-                progress=True,
+                progress=progress,
                 progress_desc=progress_desc,
                 progress_position=1,
                 progress_update_every=config.sim_progress_update_every,
@@ -162,9 +214,6 @@ def make_pde_records(
                 seed_chunk,
                 sim_nx=sim_nx,
                 output_size=image_size,
-                num_gaussian_modes=config.poisson_num_gaussian_modes,
-                source_scale=config.poisson_source_scale,
-                solution_vmax=config.poisson_solution_vmax,
                 sim_device=sim_device,
             )
         elif config.pde_kind == "fourier":
@@ -172,17 +221,12 @@ def make_pde_records(
                 seed_chunk,
                 sim_nx=sim_nx,
                 output_size=image_size,
-                num_modes=config.fourier_num_modes,
-                scale=config.fourier_scale,
-                sigma_min=config.fourier_gaussian_sigma_min,
-                sigma_max=config.fourier_gaussian_sigma_max,
-                fft_shift=config.fourier_shift,
                 sim_device=sim_device,
             )
         else:
             raise ValueError(
                 f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
-                "'fourier', 'airfoil', or 'elliptic'."
+                "'fourier', 'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
             )
 
         for pair in pairs:
@@ -209,8 +253,100 @@ def make_pde_records(
     return records
 
 
+def _make_single_pde_record_worker(args):
+    seed, kwargs = args
+    torch.set_num_threads(1)
+    return make_pde_records(1, seed_offset=seed, progress=False, **kwargs)[0]
+
+
+def make_pde_records_with_workers(
+    num_pairs,
+    seed_offset=0,
+    image_size=None,
+    initial_grid_size=None,
+    save_steps=None,
+    sim_nx=None,
+    sim_batch_size=None,
+    sim_device=None,
+    config=None,
+    progress=True,
+    use_cache=True,
+    num_workers=None,
+):
+    config = config or TrainingConfig()
+    sim_device = sim_device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cpu_generated = simulations_run_on_cpu(config, sim_device)
+    if num_workers is None:
+        num_workers = cpu_sim_worker_count(config, num_pairs=num_pairs)
+    else:
+        available = os.cpu_count() or int(num_workers)
+        num_workers = min(max(0, int(num_workers)), available, max(0, int(num_pairs)))
+
+    if not cpu_generated or num_workers <= 1 or num_pairs <= 1:
+        return make_pde_records(
+            num_pairs,
+            seed_offset=seed_offset,
+            image_size=image_size,
+            initial_grid_size=initial_grid_size,
+            save_steps=save_steps,
+            sim_nx=sim_nx,
+            sim_batch_size=sim_batch_size,
+            sim_device=sim_device,
+            config=config,
+            progress=progress,
+            use_cache=use_cache,
+        )
+
+    worker_kwargs = {
+        "image_size": image_size,
+        "initial_grid_size": initial_grid_size,
+        "save_steps": save_steps,
+        "sim_nx": sim_nx,
+        "sim_batch_size": sim_batch_size,
+        "sim_device": "cpu",
+        "config": config,
+        "use_cache": use_cache,
+    }
+    seeds = range(int(seed_offset), int(seed_offset) + int(num_pairs))
+    tasks = ((seed, worker_kwargs) for seed in seeds)
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        records = executor.map(_make_single_pde_record_worker, tasks)
+        if progress:
+            records = tqdm(
+                records,
+                total=num_pairs,
+                desc=f"{config.pde_name} CPU sims {seed_offset}",
+                position=0,
+                leave=True,
+            )
+        return list(records)
+
+
 def image_to_model_tensor(image, image_size=256):
     return rgb_image_to_model_tensor(image, image_size=image_size)
+
+
+def record_to_item(record, image_size=256, index=0):
+    condition_images = record.get("condition_images")
+    if condition_images is None:
+        condition_images = [record["initial"]]
+        if "forcing" in record:
+            condition_images.append(record["forcing"])
+
+    item = {
+        "condition_pixels": [image_to_model_tensor(image, image_size) for image in condition_images],
+        "target_pixels": image_to_model_tensor(record["solution"], image_size),
+        "index": index,
+    }
+    if "initial" in record:
+        item["initial_pixels"] = image_to_model_tensor(record["initial"], image_size)
+    if "forcing" in record:
+        item["forcing_pixels"] = image_to_model_tensor(record["forcing"], image_size)
+    if "thermal_diffusivity" in record["params"]:
+        item["thermal_diffusivity"] = torch.tensor(record["params"]["thermal_diffusivity"], dtype=torch.float32)
+    if "conditioning_values" in record["params"]:
+        item["conditioning_values"] = torch.tensor(record["params"]["conditioning_values"], dtype=torch.float32)
+    return item
 
 
 class PdePairDataset(Dataset):
@@ -223,24 +359,73 @@ class PdePairDataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[idx]
-        condition_images = record.get("condition_images")
-        if condition_images is None:
-            condition_images = [record["initial"]]
-            if "forcing" in record:
-                condition_images.append(record["forcing"])
+        return record_to_item(record, image_size=self.image_size, index=idx)
 
-        item = {
-            "condition_pixels": [image_to_model_tensor(image, self.image_size) for image in condition_images],
-            "target_pixels": image_to_model_tensor(record["solution"], self.image_size),
-            "index": idx,
-        }
-        if "initial" in record:
-            item["initial_pixels"] = image_to_model_tensor(record["initial"], self.image_size)
-        if "forcing" in record:
-            item["forcing_pixels"] = image_to_model_tensor(record["forcing"], self.image_size)
-        if "thermal_diffusivity" in record["params"]:
-            item["thermal_diffusivity"] = torch.tensor(record["params"]["thermal_diffusivity"], dtype=torch.float32)
-        return item
+
+class StreamingPdePairDataset(IterableDataset):
+    def __init__(self, config=None, image_size=256, seed_offset=0, sim_device=None, skip_seed_ranges=None):
+        self.config = config or TrainingConfig()
+        self.image_size = image_size
+        self.seed_offset = int(seed_offset)
+        self.sim_device = sim_device
+        self.skip_seed_ranges = tuple(sorted((int(a), int(b)) for a, b in (skip_seed_ranges or ()) if int(a) < int(b)))
+
+    def _next_allowed_seed(self, seed, step=1):
+        step = max(1, int(step))
+        while True:
+            for start, end in self.skip_seed_ranges:
+                if start <= seed < end:
+                    jumps = (end - seed + step - 1) // step
+                    seed += jumps * step
+                    break
+            else:
+                return seed
+
+    def __iter__(self):
+        worker = get_worker_info()
+        if worker is None:
+            seed = self.seed_offset
+            step = 1
+        else:
+            torch.set_num_threads(1)
+            seed = self.seed_offset + worker.id
+            step = worker.num_workers
+        stream_chunk_size = max(1, int(getattr(self.config, "stream_chunk_size", 1)))
+        while True:
+            seed = self._next_allowed_seed(seed, step=step)
+            if step == 1 and stream_chunk_size > 1:
+                chunk_start = seed
+                chunk_end = chunk_start + stream_chunk_size
+                for skip_start, skip_end in self.skip_seed_ranges:
+                    if chunk_start < skip_end and skip_start < chunk_end:
+                        chunk_end = max(chunk_start, skip_start)
+                        break
+                chunk_size = max(1, chunk_end - chunk_start)
+                records = make_pde_records(
+                    chunk_size,
+                    seed_offset=chunk_start,
+                    image_size=self.image_size,
+                    sim_device=self.sim_device,
+                    config=self.config,
+                    progress=False,
+                    use_cache=False,
+                )
+                for offset, record in enumerate(records):
+                    yield record_to_item(record, image_size=self.image_size, index=chunk_start + offset)
+                seed = chunk_start + chunk_size
+                continue
+
+            record = make_pde_records(
+                1,
+                seed_offset=seed,
+                image_size=self.image_size,
+                sim_device=self.sim_device,
+                config=self.config,
+                progress=False,
+                use_cache=False,
+            )[0]
+            yield record_to_item(record, image_size=self.image_size, index=seed)
+            seed += step
 
 
 def record_param_signature(record):

@@ -11,7 +11,7 @@ from .rendering import image_size_xy, rgb_image_to_model_tensor
 
 def flux2_klein_lora_targets(transformer):
     n_single = len(transformer.single_transformer_blocks)
-    return ["to_k", "to_q", "to_v", "to_out.0", "to_qkv_mlp_proj", "linear_in", "linear_out"] + [
+    return ["to_k", "to_q", "to_v", "to_out.0", "to_qkv_mlp_proj"] + [
         f"single_transformer_blocks.{i}.attn.to_out" for i in range(min(24, n_single))
     ]
 
@@ -130,8 +130,13 @@ def pde_lora_loss(pipe, batch, prompt_embeds, text_ids, device, num_inference_st
     thermal_diffusivity = batch.get("thermal_diffusivity")
     if thermal_diffusivity is not None:
         thermal_diffusivity = thermal_diffusivity.to(device=device, dtype=torch.float32)
+    conditioning_values = batch.get("conditioning_values")
+    if conditioning_values is not None:
+        conditioning_values = conditioning_values.to(device=device, dtype=torch.float32)
     transformer_kwargs = {}
-    if thermal_diffusivity is not None:
+    if conditioning_values is not None:
+        transformer_kwargs["conditioning_values"] = conditioning_values
+    elif thermal_diffusivity is not None:
         transformer_kwargs["thermal_diffusivity"] = thermal_diffusivity
     model_pred = pipe.transformer(
         hidden_states=hidden_states,
@@ -160,6 +165,7 @@ def infer_solution(
     num_inference_steps=4,
     seed=0,
     thermal_diffusivity=None,
+    conditioning_values=None,
     forcing_image=None,
     condition_images=None,
 ):
@@ -226,7 +232,11 @@ def infer_solution(
         latent_model_input = torch.cat([latents, image_latents], dim=1).to(pipe.transformer.dtype)
         with pipe.transformer.cache_context("cond"):
             transformer_kwargs = {}
-            if thermal_diffusivity is not None:
+            if conditioning_values is not None:
+                transformer_kwargs["conditioning_values"] = torch.as_tensor(
+                    conditioning_values, device=device, dtype=torch.float32
+                ).reshape(1, -1)
+            elif thermal_diffusivity is not None:
                 transformer_kwargs["thermal_diffusivity"] = torch.as_tensor(
                     [thermal_diffusivity], device=device, dtype=torch.float32
                 )

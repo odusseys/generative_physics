@@ -10,6 +10,25 @@ def normalize_base_colors(base_colors):
     return np.clip(colors, 0.0, 1.0)
 
 
+def apply_midpoint_contrast(values, contrast=1.0, midpoint=0.5):
+    contrast = float(contrast)
+    midpoint = float(midpoint)
+    if contrast <= 0.0:
+        raise ValueError("contrast must be positive")
+    if midpoint <= 0.0 or midpoint >= 1.0:
+        raise ValueError("midpoint must be between 0 and 1")
+
+    values = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+    if abs(contrast - 1.0) < 1e-6:
+        return values
+
+    out = np.empty_like(values)
+    left = values <= midpoint
+    out[left] = midpoint * np.power(values[left] / midpoint, contrast)
+    out[~left] = 1.0 - (1.0 - midpoint) * np.power((1.0 - values[~left]) / (1.0 - midpoint), contrast)
+    return out
+
+
 def cyclic_value_colorize(
     phase,
     value,
@@ -17,6 +36,7 @@ def cyclic_value_colorize(
     value_vmin=0.0,
     value_vmax=1.0,
     gamma=1.0,
+    value_softness=0.0,
     mask=None,
     mask_color=(0.0, 0.0, 0.0),
     output_dtype=np.uint8,
@@ -26,7 +46,12 @@ def cyclic_value_colorize(
     value = np.asarray(value, dtype=np.float32)
 
     span = max(float(value_vmax) - float(value_vmin), 1e-12)
-    intensity = np.clip((value - float(value_vmin)) / span, 0.0, 1.0) ** float(gamma)
+    z = (value - float(value_vmin)) / span
+    if value_softness and float(value_softness) > 0.0:
+        intensity = 1.0 - np.exp(-np.maximum(z, 0.0) / float(value_softness))
+    else:
+        intensity = np.clip(z, 0.0, 1.0)
+    intensity = np.clip(intensity, 0.0, 1.0) ** float(gamma)
 
     x = phase * colors.shape[0]
     i = np.floor(x).astype(np.int64) % colors.shape[0]

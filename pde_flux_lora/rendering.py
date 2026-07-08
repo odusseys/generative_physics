@@ -38,19 +38,32 @@ def complex_to_rgb_uint8_torch(U, amp_vmax=None, saturation=0.95):
 
 
 def linear_colormap_uint8_torch(z, cmap_name="viridis"):
-    if cmap_name != "viridis":
-        raise ValueError("Only the torch viridis renderer is implemented for batched Burgers records.")
-    colors = torch.tensor(
-        [
-            [68, 1, 84],
-            [59, 82, 139],
-            [33, 145, 140],
-            [94, 201, 97],
-            [253, 231, 37],
-        ],
-        device=z.device,
-        dtype=torch.float32,
-    ) / 255.0
+    if cmap_name == "viridis":
+        colors = torch.tensor(
+            [
+                [68, 1, 84],
+                [59, 82, 139],
+                [33, 145, 140],
+                [94, 201, 97],
+                [253, 231, 37],
+            ],
+            device=z.device,
+            dtype=torch.float32,
+        ) / 255.0
+    elif cmap_name in {"coolwarm", "cold_hot", "bwr"}:
+        colors = torch.tensor(
+            [
+                [59, 76, 192],
+                [145, 191, 219],
+                [247, 247, 247],
+                [244, 165, 130],
+                [180, 4, 38],
+            ],
+            device=z.device,
+            dtype=torch.float32,
+        ) / 255.0
+    else:
+        raise ValueError(f"Unsupported torch colormap: {cmap_name!r}.")
     scaled = z.clamp(0.0, 1.0) * (len(colors) - 1)
     idx = torch.floor(scaled).to(torch.long).clamp(max=len(colors) - 2)
     frac = (scaled - idx.to(scaled.dtype))[..., None]

@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 
-import numpy as np
 import torch
 
 
@@ -18,68 +17,27 @@ class TrainingConfig:
     sim_nx: int = 2048
     sim_adaptive_dt: bool = False
     sim_compile_step: bool = True
+    sim_num_workers: int = 16
+    stream_chunk_size: int = 8
     sim_progress_update_every: int = 8
 
-    heat_t: float = 1.5
-    heat_num_modes: int = 32
-    heat_scale: float = 1.0
-    heat_forcing_num_modes: int = 12
-    heat_forcing_scale: float = 1.0
-    heat_diffusivity_min: float = 1e-5
-    heat_diffusivity_max: float = 1e-2
-
     elliptic_grid_size: int = 256
-    elliptic_max_cycles: float = 5.5
-    elliptic_a_min: float = 0.025
-    elliptic_a_max: float = 0.075
-    elliptic_mixed_rho: float = 0.12
-    elliptic_first_order_scale: float = 0.02
-    elliptic_reaction_min: float = 40.0
-    elliptic_reaction_max: float = 120.0
-    elliptic_solution_vmin: float = 0.0
-    elliptic_solution_vmax: float = 1.0
-    elliptic_num_workers: int = 16
-    elliptic_worker_chunksize: int = 1
     elliptic_cache_dir: str = "/home/ubuntu/datasets/elliptic"
 
-    cgl_t: float = 12.0
-    cgl_domain_length: float = 128.0
-    cgl_c1: float = 2.0
-    cgl_c3: float = 1.2
-    cgl_num_modes: int = 16
-    cgl_amp_scale: float = 0.25
-    cgl_phase_scale: float = np.pi
-    cgl_substeps_per_frame: int = 8
+    eikonal_grid_size: int = 256
+
+    ot_solve_grid_size: int = 24
 
     poisson_grid_size: int = 256
-    poisson_num_gaussian_modes: int = 12
-    poisson_source_scale: float = 1.0
-    poisson_solution_vmax: float = 0.05
 
     fourier_grid_size: int = 256
-    fourier_num_modes: int = 32
-    fourier_scale: float = 1.0
-    fourier_gaussian_sigma_min: float = 0.006
-    fourier_gaussian_sigma_max: float = 0.12
-    fourier_max_frequency: int = 32
-    fourier_shift: bool = True
 
     airfoil_grid_size: int = 256
-    airfoil_min_points: int = 5
-    airfoil_max_points: int = 10
-    airfoil_samples_per_segment: int = 28
-    airfoil_handle_scale: float = 0.12
-    airfoil_body_box_fraction: float = 0.5
-    airfoil_x_stretch: float = 1.8
-    airfoil_y_stretch: float = 0.55
-    airfoil_flow_speed: float = 1.0
-    airfoil_color_mode: str = "rgb"
-    airfoil_speed_vmin: float = 0.5
-    airfoil_speed_vmax: float = 2.1
-    airfoil_num_workers: int = 0
-    airfoil_worker_chunksize: int = 4
 
-    num_train_pairs: int = 2048 // 2
+    elasticity_grid_size: int = 256
+
+    fracture_grid_size: int = 56
+
     num_eval_pairs: int = 24
     train_seed_offset: int = 10_000
     eval_seed_offset: int = 20_000
@@ -88,7 +46,7 @@ class TrainingConfig:
     max_train_steps: int = 10000
     validate_every_n_steps: int = 100
     validation_num_images: int = 8
-    loss_ema_alpha: float = 0.08
+    loss_ema_alpha: float = 0.03
 
     learning_rate: float = 1e-4
     lora_rank: int = 16
@@ -116,9 +74,17 @@ class TrainingConfig:
             return "Airfoil Potential Flow"
         if self.pde_kind == "elliptic":
             return "Variable-Coefficient Elliptic PDE"
+        if self.pde_kind == "elasticity":
+            return "Random-Hole Elasticity"
+        if self.pde_kind == "eikonal":
+            return "Eikonal Travel Time"
+        if self.pde_kind == "ot":
+            return "Optimal Transport"
+        if self.pde_kind == "fracture":
+            return "Phase-Field Fracture"
         raise ValueError(
             f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
-            "'fourier', 'airfoil', or 'elliptic'."
+            "'fourier', 'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
         )
 
     @property
@@ -135,8 +101,10 @@ class TrainingConfig:
         if self.pde_kind == "poisson":
             return "Given the 2D Poisson source image, generate the zero-boundary Poisson solution image."
         if self.pde_kind == "fourier":
+            from .fourier import FOURIER_NUM_MODES
+
             return (
-                f"Given a scalar function image with {self.fourier_num_modes} random-covariance Gaussian modes, "
+                f"Given a scalar function image with {FOURIER_NUM_MODES} random-covariance Gaussian modes, "
                 "generate the log magnitude of its 2D Fourier transform."
             )
         if self.pde_kind == "airfoil":
@@ -146,6 +114,23 @@ class TrainingConfig:
                 "Given seven 2D variable-coefficient elliptic PDE images for a20, a11, a02, a10, a01, a00, "
                 "and forcing f, generate the zero-boundary solution image."
             )
+        if self.pde_kind == "elasticity":
+            return (
+                "Given a binary mask image of a random hole in an elastic plate plus material and biaxial "
+                "far-field stress scalars, generate the stress field image."
+            )
+        if self.pde_kind == "eikonal":
+            return "Given a 2D refractive index image, generate the center-source eikonal propagation time image."
+        if self.pde_kind == "ot":
+            return (
+                "Given source distribution, target distribution, and transport cost images, "
+                "generate the entropic optimal transport source potential image."
+            )
+        if self.pde_kind == "fracture":
+            return (
+                "Given an initial phase-field crack damage image plus material and biaxial strain scalars, "
+                "generate the final fracture damage image."
+            )
         return f"Given the initial 1D {self.pde_name} condition image, generate the {self.pde_name} time-evolution image."
 
     @property
@@ -154,16 +139,120 @@ class TrainingConfig:
 
     @property
     def heat_log_diffusivity_mean(self) -> float:
-        return 0.5 * (math.log(self.heat_diffusivity_min) + math.log(self.heat_diffusivity_max))
+        from .heat import HEAT_DIFFUSIVITY_MAX, HEAT_DIFFUSIVITY_MIN
+
+        return 0.5 * (math.log(HEAT_DIFFUSIVITY_MIN) + math.log(HEAT_DIFFUSIVITY_MAX))
 
     @property
     def heat_log_diffusivity_std(self) -> float:
-        return (math.log(self.heat_diffusivity_max) - math.log(self.heat_diffusivity_min)) / math.sqrt(12.0)
+        from .heat import HEAT_DIFFUSIVITY_MAX, HEAT_DIFFUSIVITY_MIN
+
+        return (math.log(HEAT_DIFFUSIVITY_MAX) - math.log(HEAT_DIFFUSIVITY_MIN)) / math.sqrt(12.0)
+
+    @staticmethod
+    def _log_uniform_mean_std(min_value: float, max_value: float) -> tuple[float, float]:
+        return (
+            0.5 * (math.log(min_value) + math.log(max_value)),
+            (math.log(max_value) - math.log(min_value)) / math.sqrt(12.0),
+        )
+
+    @staticmethod
+    def _uniform_mean_std(min_value: float, max_value: float) -> tuple[float, float]:
+        return (
+            0.5 * (float(min_value) + float(max_value)),
+            (float(max_value) - float(min_value)) / math.sqrt(12.0),
+        )
+
+    @property
+    def elasticity_conditioning_names(self) -> tuple[str, ...]:
+        from .elasticity import ELASTICITY_CONDITIONING_NAMES
+
+        return ELASTICITY_CONDITIONING_NAMES
+
+    @property
+    def elasticity_conditioning_transforms(self) -> tuple[str, ...]:
+        from .elasticity import ELASTICITY_CONDITIONING_TRANSFORMS
+
+        return ELASTICITY_CONDITIONING_TRANSFORMS
+
+    @property
+    def elasticity_conditioning_mean(self) -> tuple[float, ...]:
+        from .elasticity import (
+            ELASTICITY_HORIZONTAL_STRESS_MAX,
+            ELASTICITY_HORIZONTAL_STRESS_MIN,
+            ELASTICITY_LAMBDA_MAX,
+            ELASTICITY_LAMBDA_MIN,
+            ELASTICITY_MU_MAX,
+            ELASTICITY_MU_MIN,
+            ELASTICITY_VERTICAL_STRESS_MAX,
+            ELASTICITY_VERTICAL_STRESS_MIN,
+        )
+
+        lambda_mean, _ = self._log_uniform_mean_std(ELASTICITY_LAMBDA_MIN, ELASTICITY_LAMBDA_MAX)
+        mu_mean, _ = self._log_uniform_mean_std(ELASTICITY_MU_MIN, ELASTICITY_MU_MAX)
+        sigma_x_mean, _ = self._uniform_mean_std(
+            ELASTICITY_HORIZONTAL_STRESS_MIN,
+            ELASTICITY_HORIZONTAL_STRESS_MAX,
+        )
+        sigma_y_mean, _ = self._uniform_mean_std(
+            ELASTICITY_VERTICAL_STRESS_MIN,
+            ELASTICITY_VERTICAL_STRESS_MAX,
+        )
+        return (lambda_mean, mu_mean, sigma_x_mean, sigma_y_mean)
+
+    @property
+    def elasticity_conditioning_std(self) -> tuple[float, ...]:
+        from .elasticity import (
+            ELASTICITY_HORIZONTAL_STRESS_MAX,
+            ELASTICITY_HORIZONTAL_STRESS_MIN,
+            ELASTICITY_LAMBDA_MAX,
+            ELASTICITY_LAMBDA_MIN,
+            ELASTICITY_MU_MAX,
+            ELASTICITY_MU_MIN,
+            ELASTICITY_VERTICAL_STRESS_MAX,
+            ELASTICITY_VERTICAL_STRESS_MIN,
+        )
+
+        _, lambda_std = self._log_uniform_mean_std(ELASTICITY_LAMBDA_MIN, ELASTICITY_LAMBDA_MAX)
+        _, mu_std = self._log_uniform_mean_std(ELASTICITY_MU_MIN, ELASTICITY_MU_MAX)
+        _, sigma_x_std = self._uniform_mean_std(
+            ELASTICITY_HORIZONTAL_STRESS_MIN,
+            ELASTICITY_HORIZONTAL_STRESS_MAX,
+        )
+        _, sigma_y_std = self._uniform_mean_std(
+            ELASTICITY_VERTICAL_STRESS_MIN,
+            ELASTICITY_VERTICAL_STRESS_MAX,
+        )
+        return (lambda_std, mu_std, sigma_x_std, sigma_y_std)
+
+    @property
+    def fracture_conditioning_names(self) -> tuple[str, ...]:
+        from .fracture import FRACTURE_CONDITIONING_NAMES
+
+        return FRACTURE_CONDITIONING_NAMES
+
+    @property
+    def fracture_conditioning_transforms(self) -> tuple[str, ...]:
+        from .fracture import FRACTURE_CONDITIONING_TRANSFORMS
+
+        return FRACTURE_CONDITIONING_TRANSFORMS
+
+    @property
+    def fracture_conditioning_mean(self) -> tuple[float, ...]:
+        from .fracture import FRACTURE_CONDITIONING_MEAN
+
+        return FRACTURE_CONDITIONING_MEAN
+
+    @property
+    def fracture_conditioning_std(self) -> tuple[float, ...]:
+        from .fracture import FRACTURE_CONDITIONING_STD
+
+        return FRACTURE_CONDITIONING_STD
 
     @property
     def sim_batch_size(self) -> int:
         if self.pde_kind in {"poisson", "fourier"}:
             return 32 if torch.cuda.is_available() else 1
-        if self.pde_kind in {"airfoil", "elliptic"}:
+        if self.pde_kind in {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture"}:
             return 1
         return 256 if torch.cuda.is_available() else 1

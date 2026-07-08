@@ -1,9 +1,9 @@
 """Tools for generating PDE image pairs and training Flux.2 Klein LoRA adapters."""
 
 from .config import TrainingConfig
-from .data import PdePairDataset, make_pde_records
+from .data import PdePairDataset, StreamingPdePairDataset, make_pde_records
 
-__all__ = ["PdePairDataset", "TrainingConfig", "make_pde_records", "run_training"]
+__all__ = ["PdePairDataset", "StreamingPdePairDataset", "TrainingConfig", "make_pde_records", "run_training"]
 
 
 def __getattr__(name):

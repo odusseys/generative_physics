@@ -5,6 +5,14 @@ from .numerics import downsample_solution_torch
 from .rendering import scalar_to_rgb_uint8_torch
 
 
+FOURIER_NUM_MODES = 32
+FOURIER_SCALE = 1.0
+FOURIER_GAUSSIAN_SIGMA_MIN = 0.006
+FOURIER_GAUSSIAN_SIGMA_MAX = 0.12
+FOURIER_MAX_FREQUENCY = 32
+FOURIER_SHIFT = True
+
+
 def _gaussian_fourier_function_batch(
     seeds,
     grid_size,
@@ -34,12 +42,12 @@ def generate_fourier_image_pairs(
     seeds,
     sim_nx=256,
     output_size=256,
-    num_modes=32,
-    scale=1.0,
-    sigma_min=0.006,
-    sigma_max=0.12,
-    max_frequency=None,
-    fft_shift=True,
+    num_modes=FOURIER_NUM_MODES,
+    scale=FOURIER_SCALE,
+    sigma_min=FOURIER_GAUSSIAN_SIGMA_MIN,
+    sigma_max=FOURIER_GAUSSIAN_SIGMA_MAX,
+    max_frequency=FOURIER_MAX_FREQUENCY,
+    fft_shift=FOURIER_SHIFT,
     cmap_name="viridis",
     sim_device=None,
 ):

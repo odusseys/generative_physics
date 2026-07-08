@@ -6,6 +6,15 @@ from .numerics import downsample_solution_torch, periodic_linear_upsample_1d
 from .rendering import repeat_rgb_row_view, scalar_to_rgb_uint8_torch
 
 
+HEAT_T = 1.5
+HEAT_NUM_MODES = 24
+HEAT_SCALE = 1.0
+HEAT_FORCING_NUM_MODES = 12
+HEAT_FORCING_SCALE = 1.0
+HEAT_DIFFUSIVITY_MIN = 1e-5
+HEAT_DIFFUSIVITY_MAX = 1e-2
+
+
 def _heat_initial_and_diffusivity_batch(
     seeds,
     nx,
@@ -16,6 +25,8 @@ def _heat_initial_and_diffusivity_batch(
     device,
     dtype=torch.float32,
 ):
+    if num_modes < 1:
+        raise ValueError("heat_num_modes must be at least 1.")
     if diffusivity_min <= 0 or diffusivity_max <= 0:
         raise ValueError("Heat thermal diffusivity bounds must be positive.")
     if diffusivity_min > diffusivity_max:
@@ -28,22 +39,30 @@ def _heat_initial_and_diffusivity_batch(
     amps = []
     phases = []
     diffusivities = []
+    mode_counts = []
 
     log_min = np.log(diffusivity_min)
     log_max = np.log(diffusivity_max)
     for seed in seeds:
         rng = np.random.default_rng(seed)
-        amps.append((rng.normal(size=num_modes).astype(np.float32) / denom)[None, :])
-        phases.append(rng.uniform(0, 2 * np.pi, size=num_modes).astype(np.float32)[None, :])
+        mode_count = int(rng.integers(1, int(num_modes) + 1))
+        amp = np.zeros(int(num_modes), dtype=np.float32)
+        phase = np.zeros(int(num_modes), dtype=np.float32)
+        amp[:mode_count] = rng.normal(size=mode_count).astype(np.float32) / denom[:mode_count]
+        phase[:mode_count] = rng.uniform(0, 2 * np.pi, size=mode_count).astype(np.float32)
+        amps.append(amp[None, :])
+        phases.append(phase[None, :])
         diffusivities.append(np.exp(rng.uniform(log_min, log_max)))
+        mode_counts.append(mode_count)
 
     amps = torch.as_tensor(np.concatenate(amps, axis=0), device=device, dtype=dtype)
     phases = torch.as_tensor(np.concatenate(phases, axis=0), device=device, dtype=dtype)
     diffusivities = torch.as_tensor(diffusivities, device=device, dtype=dtype)
+    mode_counts = torch.as_tensor(mode_counts, device=device, dtype=torch.long)
     angles = 2 * torch.pi * k[None, :, None] * x[None, None, :] + phases[:, :, None]
     u = (amps[:, :, None] * torch.sin(angles)).sum(dim=1)
     u = scale * u / (u.std(dim=-1, keepdim=True, unbiased=False) + 1e-12)
-    return x, u, diffusivities
+    return x, u, diffusivities, mode_counts
 
 
 def _forcing_rng(seed, endpoint_index=0):
@@ -114,13 +133,13 @@ def _interpolate_forcing_batch(forcing_start, forcing_end, num_steps):
 def solve_heat_batch_torch(
     seeds,
     nx=2048,
-    T=0.5,
-    num_modes=32,
-    scale=1.0,
-    forcing_num_modes=12,
-    forcing_scale=1.0,
-    diffusivity_min=1e-4,
-    diffusivity_max=5e-3,
+    T=HEAT_T,
+    num_modes=HEAT_NUM_MODES,
+    scale=HEAT_SCALE,
+    forcing_num_modes=HEAT_FORCING_NUM_MODES,
+    forcing_scale=HEAT_FORCING_SCALE,
+    diffusivity_min=HEAT_DIFFUSIVITY_MIN,
+    diffusivity_max=HEAT_DIFFUSIVITY_MAX,
     save_steps=512,
     initial_grid_size=None,
     device=None,
@@ -137,7 +156,7 @@ def solve_heat_batch_torch(
         raise ValueError("seeds must contain at least one seed")
 
     initial_grid_size = int(initial_grid_size or nx)
-    _, u_initial, diffusivities = _heat_initial_and_diffusivity_batch(
+    _, u_initial, diffusivities, initial_mode_counts = _heat_initial_and_diffusivity_batch(
         seeds,
         initial_grid_size,
         num_modes,
@@ -244,6 +263,7 @@ def solve_heat_batch_torch(
             forcing_start_initial,
             forcing_end_initial,
             diffusivities,
+            initial_mode_counts,
             forcing_start_mode_counts,
             forcing_end_mode_counts,
         )
@@ -255,15 +275,15 @@ def generate_heat_image_pairs(
     sim_nx=2048,
     output_size=512,
     initial_grid_size=None,
-    T=0.5,
-    num_modes=32,
-    scale=1.0,
-    forcing_num_modes=12,
-    forcing_scale=1.0,
-    diffusivity_min=1e-4,
-    diffusivity_max=5e-3,
+    T=HEAT_T,
+    num_modes=HEAT_NUM_MODES,
+    scale=HEAT_SCALE,
+    forcing_num_modes=HEAT_FORCING_NUM_MODES,
+    forcing_scale=HEAT_FORCING_SCALE,
+    diffusivity_min=HEAT_DIFFUSIVITY_MIN,
+    diffusivity_max=HEAT_DIFFUSIVITY_MAX,
     save_steps=512,
-    cmap_name="viridis",
+    cmap_name="coolwarm",
     sim_device=None,
     progress=False,
     progress_desc=None,
@@ -280,6 +300,7 @@ def generate_heat_image_pairs(
         forcing_start_initial,
         forcing_end_initial,
         diffusivities,
+        initial_mode_counts,
         forcing_start_mode_counts,
         forcing_end_mode_counts,
     ) = solve_heat_batch_torch(
@@ -322,6 +343,7 @@ def generate_heat_image_pairs(
     )
     bound = bound.detach().cpu().numpy()
     diffusivities = diffusivities.detach().cpu().numpy()
+    initial_mode_counts = initial_mode_counts.detach().cpu().numpy()
     forcing_start_mode_counts = forcing_start_mode_counts.detach().cpu().numpy()
     forcing_end_mode_counts = forcing_end_mode_counts.detach().cpu().numpy()
     del U, U_img, u_initial, u0_img, forcing_start_initial, forcing_end_initial, forcing_start_img, forcing_end_img
@@ -335,6 +357,7 @@ def generate_heat_image_pairs(
         forcing_solution_img,
         bound_i,
         diffusivity,
+        initial_mode_count,
         forcing_start_mode_count,
         forcing_end_mode_count,
     ) in zip(
@@ -344,6 +367,7 @@ def generate_heat_image_pairs(
         forcing_rgb,
         bound,
         diffusivities,
+        initial_mode_counts,
         forcing_start_mode_counts,
         forcing_end_mode_counts,
     ):
@@ -355,6 +379,7 @@ def generate_heat_image_pairs(
             "initial_grid_size": initial_grid_size,
             "T": T,
             "num_modes": num_modes,
+            "initial_active_modes": int(initial_mode_count),
             "scale": scale,
             "forcing_num_modes": forcing_num_modes,
             "forcing_active_modes": int(max(forcing_start_mode_count, forcing_end_mode_count)),

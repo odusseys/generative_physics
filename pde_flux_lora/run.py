@@ -1,7 +1,7 @@
 import gc
+import math
 import random
 import sys
-from itertools import cycle
 
 import numpy as np
 import torch
@@ -11,10 +11,109 @@ from peft.utils import get_peft_model_state_dict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .airfoil import (
+    AIRFOIL_COLOR_MODE,
+    AIRFOIL_FLOW_SPEED,
+    AIRFOIL_MAX_POINTS,
+    AIRFOIL_MIN_POINTS,
+    AIRFOIL_X_STRETCH,
+    AIRFOIL_Y_STRETCH,
+)
 from .config import TrainingConfig
-from .data import PdePairDataset, assert_disjoint_record_splits, make_pde_records
+from .data import (
+    PdePairDataset,
+    StreamingPdePairDataset,
+    cpu_sim_worker_count,
+    make_pde_records_with_workers,
+    simulation_grid_size,
+    simulations_run_on_cpu,
+)
+from .eikonal import (
+    EIKONAL_CMAP_NAME,
+    EIKONAL_MAX_COMPONENTS,
+    EIKONAL_MIN_COMPONENTS,
+    EIKONAL_REFRACTIVE_INDEX_CONTRAST,
+    EIKONAL_REFRACTIVE_INDEX_MAX,
+    EIKONAL_REFRACTIVE_INDEX_MEAN,
+    EIKONAL_REFRACTIVE_INDEX_MIN,
+    EIKONAL_SIGMA_MAX,
+    EIKONAL_SIGMA_MIN,
+    EIKONAL_SOLUTION_CMAP_NAME,
+    EIKONAL_SOLUTION_GAMMA,
+    EIKONAL_SOLUTION_MIDPOINT_CONTRAST,
+    EIKONAL_SOLUTION_VMAX,
+    EIKONAL_WEIGHT_SIGMA,
+)
+from .elasticity import (
+    ELASTICITY_FAR_FIELD_STRESS,
+    ELASTICITY_HANDLE_SCALE,
+    ELASTICITY_HOLE_BOX_FRACTION,
+    ELASTICITY_HORIZONTAL_STRESS_MAX,
+    ELASTICITY_HORIZONTAL_STRESS_MIN,
+    ELASTICITY_LAMBDA,
+    ELASTICITY_LAMBDA_MAX,
+    ELASTICITY_LAMBDA_MIN,
+    ELASTICITY_MAX_POINTS,
+    ELASTICITY_MIN_POINTS,
+    ELASTICITY_MU,
+    ELASTICITY_MU_MAX,
+    ELASTICITY_MU_MIN,
+    ELASTICITY_PLANE_STRESS,
+    ELASTICITY_SAMPLES_PER_SEGMENT,
+    ELASTICITY_STRESS_PERCENTILE,
+    ELASTICITY_VERTICAL_STRESS_MAX,
+    ELASTICITY_VERTICAL_STRESS_MIN,
+)
+from .elliptic import (
+    ELLIPTIC_A_MAX,
+    ELLIPTIC_A_MIN,
+    ELLIPTIC_MAX_CYCLES,
+    ELLIPTIC_REACTION_MAX,
+    ELLIPTIC_REACTION_MIN,
+)
 from .flux_lora import flux2_klein_lora_targets, pde_lora_loss, trainable_parameter_count
-from .thermal_modulation import attach_thermal_coefficient_modulation
+from .fourier import (
+    FOURIER_GAUSSIAN_SIGMA_MAX,
+    FOURIER_GAUSSIAN_SIGMA_MIN,
+    FOURIER_NUM_MODES,
+    FOURIER_SCALE,
+    FOURIER_SHIFT,
+)
+from .fracture import (
+    FRACTURE_BIAXIAL_STRAIN_MAX,
+    FRACTURE_BIAXIAL_STRAIN_MIN,
+    FRACTURE_GC_MAX,
+    FRACTURE_GC_MIN,
+    FRACTURE_HIGH_STRAIN_MAX,
+    FRACTURE_HIGH_STRAIN_MIN,
+    FRACTURE_INNER_ITERS,
+    FRACTURE_LOW_STRAIN_MAX,
+    FRACTURE_LOW_STRAIN_MIN,
+    FRACTURE_MAX_DEFECTS,
+    FRACTURE_MIN_DEFECTS,
+    FRACTURE_NU_MAX,
+    FRACTURE_NU_MIN,
+    FRACTURE_STEPS,
+)
+from .heat import HEAT_FORCING_NUM_MODES, HEAT_FORCING_SCALE
+from .ot import (
+    OT_COST_PATH_SAMPLES,
+    OT_COST_SIGMA_MULTIPLIER,
+    OT_COST_STRENGTH,
+    OT_EPSILON,
+    OT_LOGPROB_VMAX,
+    OT_LOGPROB_VMIN,
+    OT_MAX_COMPONENTS,
+    OT_MIN_COMPONENTS,
+    OT_POTENTIAL_CMAP_NAME,
+    OT_POTENTIAL_VMAX,
+    OT_POTENTIAL_VMIN,
+    OT_SIGMA_MAX,
+    OT_SIGMA_MIN,
+    OT_SINKHORN_ITERS,
+)
+from .poisson import POISSON_NUM_GAUSSIAN_MODES, POISSON_SOURCE_SCALE
+from .thermal_modulation import attach_scalar_parameter_modulation, attach_thermal_coefficient_modulation
 from .visualization import show_random_inference_grid, show_smoothed_loss
 
 
@@ -22,10 +121,23 @@ def _count_parameters(parameters):
     return sum(p.numel() for p in parameters)
 
 
+def _fixed_or_range(fixed, min_value, max_value):
+    if fixed is not None:
+        return f"{fixed:g}"
+    return f"{min_value:g}..{max_value:g}"
+
+
+def _cosine_decay_lr(initial_lr, step, max_steps):
+    if max_steps <= 0:
+        return float(initial_lr)
+    progress = min(max(float(step) / float(max_steps), 0.0), 1.0)
+    return float(initial_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
 def print_parameter_report(pipe):
     transformer_params = list(pipe.transformer.named_parameters())
     lora_trainable = _count_parameters(p for name, p in transformer_params if p.requires_grad and "lora_" in name)
-    thermal_trainable = _count_parameters(
+    scalar_modulation_trainable = _count_parameters(
         p for name, p in transformer_params if p.requires_grad and name.startswith("thermal_modulation.")
     )
     other_transformer_trainable = _count_parameters(
@@ -37,12 +149,12 @@ def print_parameter_report(pipe):
     frozen_vae = _count_parameters(p for p in pipe.vae.parameters() if not p.requires_grad)
     frozen_text_encoder = _count_parameters(p for p in pipe.text_encoder.parameters() if not p.requires_grad)
 
-    trainable_total = lora_trainable + thermal_trainable + other_transformer_trainable
+    trainable_total = lora_trainable + scalar_modulation_trainable + other_transformer_trainable
     frozen_total = frozen_transformer + frozen_vae + frozen_text_encoder
     print("parameter report:")
     print(f"  trainable: {trainable_total:,}")
     print(f"    LoRA adapters: {lora_trainable:,}")
-    print(f"    thermal AdaLN modulators: {thermal_trainable:,}")
+    print(f"    scalar AdaLN modulators: {scalar_modulation_trainable:,}")
     print(f"    other transformer trainable: {other_transformer_trainable:,}")
     print(f"  frozen: {frozen_total:,}")
     print(f"    transformer base: {frozen_transformer:,}")
@@ -60,15 +172,10 @@ def run_training(config=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"device={device}, dtype={weight_dtype}")
-    data_grid_size = config.sim_nx
-    if config.pde_kind == "poisson":
-        data_grid_size = config.poisson_grid_size
-    elif config.pde_kind == "fourier":
-        data_grid_size = config.fourier_grid_size
-    elif config.pde_kind == "airfoil":
-        data_grid_size = config.airfoil_grid_size
-    elif config.pde_kind == "elliptic":
-        data_grid_size = config.elliptic_grid_size
+    data_grid_size = simulation_grid_size(config)
+    cpu_generated_samples = simulations_run_on_cpu(config, device)
+    sample_sim_device = torch.device("cpu") if cpu_generated_samples else device
+    sample_num_workers = cpu_sim_worker_count(config) if cpu_generated_samples else 0
 
     print(
         f"Generating {config.pde_name} data: sim_nx={data_grid_size}, save_steps={config.sim_save_steps}, "
@@ -78,62 +185,141 @@ def run_training(config=None):
     if config.pde_kind == "heat":
         print(
             "Heat forcing: "
-            f"up to {config.heat_forcing_num_modes} modes, scale={config.heat_forcing_scale:g}"
+            f"up to {HEAT_FORCING_NUM_MODES} modes, scale={HEAT_FORCING_SCALE:g}"
         )
     elif config.pde_kind == "poisson":
         print(
             "Poisson source: "
-            f"{config.poisson_num_gaussian_modes} Gaussian modes, scale={config.poisson_source_scale:g}"
+            f"{POISSON_NUM_GAUSSIAN_MODES} Gaussian modes, scale={POISSON_SOURCE_SCALE:g}"
         )
     elif config.pde_kind == "fourier":
         print(
             "Fourier source: "
-            f"{config.fourier_num_modes} random-covariance Gaussian modes, "
-            f"sigma={config.fourier_gaussian_sigma_min:g}..{config.fourier_gaussian_sigma_max:g}, "
-            f"scale={config.fourier_scale:g}, fft_shift={config.fourier_shift}"
+            f"{FOURIER_NUM_MODES} random-covariance Gaussian modes, "
+            f"sigma={FOURIER_GAUSSIAN_SIGMA_MIN:g}..{FOURIER_GAUSSIAN_SIGMA_MAX:g}, "
+            f"scale={FOURIER_SCALE:g}, fft_shift={FOURIER_SHIFT}"
         )
     elif config.pde_kind == "airfoil":
         print(
             "Airfoil flow: "
-            f"points={config.airfoil_min_points}..{config.airfoil_max_points}, "
-            f"stretch=({config.airfoil_x_stretch:g}, {config.airfoil_y_stretch:g}), "
-            f"U={config.airfoil_flow_speed:g}, color={config.airfoil_color_mode}, "
-            f"workers={config.airfoil_num_workers or 'auto'}"
+            f"points={AIRFOIL_MIN_POINTS}..{AIRFOIL_MAX_POINTS}, "
+            f"stretch=({AIRFOIL_X_STRETCH:g}, {AIRFOIL_Y_STRETCH:g}), "
+            f"U={AIRFOIL_FLOW_SPEED:g}, color={AIRFOIL_COLOR_MODE}"
         )
     elif config.pde_kind == "elliptic":
         print(
             "Elliptic coefficients: "
-            f"fields=a20,a11,a02,a10,a01,a00,f, max_cycles={config.elliptic_max_cycles:g}, "
-            f"a={config.elliptic_a_min:g}..{config.elliptic_a_max:g}, "
-            f"reaction={config.elliptic_reaction_min:g}..{config.elliptic_reaction_max:g}, "
-            f"workers={config.elliptic_num_workers}, cache={config.elliptic_cache_dir}"
+            f"fields=a20,a11,a02,a10,a01,a00,f, max_cycles={ELLIPTIC_MAX_CYCLES:g}, "
+            f"a={ELLIPTIC_A_MIN:g}..{ELLIPTIC_A_MAX:g}, "
+            f"reaction={ELLIPTIC_REACTION_MIN:g}..{ELLIPTIC_REACTION_MAX:g}, "
+            f"eval_cache={config.elliptic_cache_dir}"
         )
-    print("generating training records...")
-    train_records = make_pde_records(
-        config.num_train_pairs,
-        seed_offset=config.train_seed_offset,
-        sim_device=device,
-        config=config,
+    elif config.pde_kind == "elasticity":
+        sigma_x_label = _fixed_or_range(
+            ELASTICITY_FAR_FIELD_STRESS,
+            ELASTICITY_HORIZONTAL_STRESS_MIN,
+            ELASTICITY_HORIZONTAL_STRESS_MAX,
+        )
+        sigma_y_label = "0" if ELASTICITY_FAR_FIELD_STRESS is not None else _fixed_or_range(
+            None,
+            ELASTICITY_VERTICAL_STRESS_MIN,
+            ELASTICITY_VERTICAL_STRESS_MAX,
+        )
+        print(
+            "Elasticity holes: "
+            f"points={ELASTICITY_MIN_POINTS}..{ELASTICITY_MAX_POINTS}, "
+            f"samples_per_segment={ELASTICITY_SAMPLES_PER_SEGMENT}, handle_scale={ELASTICITY_HANDLE_SCALE:g}, "
+            f"hole_box={ELASTICITY_HOLE_BOX_FRACTION:g}*grid, "
+            f"lambda={_fixed_or_range(ELASTICITY_LAMBDA, ELASTICITY_LAMBDA_MIN, ELASTICITY_LAMBDA_MAX)}, "
+            f"mu={_fixed_or_range(ELASTICITY_MU, ELASTICITY_MU_MIN, ELASTICITY_MU_MAX)}, "
+            f"sigma_x={sigma_x_label}, "
+            f"sigma_y={sigma_y_label}, "
+            f"plane_stress={ELASTICITY_PLANE_STRESS}, stress_percentile={ELASTICITY_STRESS_PERCENTILE:g}"
+        )
+    elif config.pde_kind == "eikonal":
+        print(
+            "Eikonal refractive index: "
+            f"components={EIKONAL_MIN_COMPONENTS}..{EIKONAL_MAX_COMPONENTS}, "
+            f"sigma={EIKONAL_SIGMA_MIN:g}..{EIKONAL_SIGMA_MAX:g}, "
+            f"weight_sigma={EIKONAL_WEIGHT_SIGMA:g}, "
+            f"mean={EIKONAL_REFRACTIVE_INDEX_MEAN:g}, "
+            f"contrast={EIKONAL_REFRACTIVE_INDEX_CONTRAST:g}, "
+            f"n={EIKONAL_REFRACTIVE_INDEX_MIN:g}..{EIKONAL_REFRACTIVE_INDEX_MAX:g}, "
+            f"time_vmax={EIKONAL_SOLUTION_VMAX:g}, "
+            f"time_gamma={EIKONAL_SOLUTION_GAMMA:g}, "
+            f"time_midpoint={EIKONAL_SOLUTION_VMAX * (0.5 ** (1.0 / EIKONAL_SOLUTION_GAMMA)):g}, "
+            f"time_mid_contrast={EIKONAL_SOLUTION_MIDPOINT_CONTRAST:g}, "
+            f"cmap={EIKONAL_CMAP_NAME}, time_cmap={EIKONAL_SOLUTION_CMAP_NAME}, source=center"
+        )
+    elif config.pde_kind == "ot":
+        print(
+            "Optimal transport Sinkhorn: "
+            f"solve_grid={config.ot_solve_grid_size}, "
+            f"components={OT_MIN_COMPONENTS}..{OT_MAX_COMPONENTS}, "
+            f"sigma={OT_SIGMA_MIN:g}..{OT_SIGMA_MAX:g}, "
+            f"eps={OT_EPSILON:g}, iters={OT_SINKHORN_ITERS}, "
+            f"cost_strength={OT_COST_STRENGTH:g}, "
+            f"cost_sigma_multiplier={OT_COST_SIGMA_MULTIPLIER:g}, "
+            f"cost_path_samples={OT_COST_PATH_SAMPLES}, "
+            f"logprob={OT_LOGPROB_VMIN:g}..{OT_LOGPROB_VMAX:g}, "
+            f"potential={OT_POTENTIAL_VMIN:g}..{OT_POTENTIAL_VMAX:g}, "
+            f"potential_cmap={OT_POTENTIAL_CMAP_NAME}"
+        )
+    elif config.pde_kind == "fracture":
+        print(
+            "Phase-field fracture: "
+            f"grid={config.fracture_grid_size}, "
+            f"nu={FRACTURE_NU_MIN:g}..{FRACTURE_NU_MAX:g}, "
+            f"Gc={FRACTURE_GC_MIN:g}..{FRACTURE_GC_MAX:g}, "
+            f"eps_low={FRACTURE_LOW_STRAIN_MIN:g}..{FRACTURE_LOW_STRAIN_MAX:g}, "
+            f"eps_high={FRACTURE_HIGH_STRAIN_MIN:g}..{FRACTURE_HIGH_STRAIN_MAX:g}, "
+            f"eps_biaxial={FRACTURE_BIAXIAL_STRAIN_MIN:g}..{FRACTURE_BIAXIAL_STRAIN_MAX:g}, "
+            f"defects={FRACTURE_MIN_DEFECTS}..{FRACTURE_MAX_DEFECTS}, "
+            f"steps={FRACTURE_STEPS}, inner_iters={FRACTURE_INNER_ITERS}"
+        )
+    print(
+        "training data: streaming fresh simulations on the fly "
+        f"from seed {config.train_seed_offset}; no fixed training sample count"
     )
-    eval_records = make_pde_records(
+    if cpu_generated_samples:
+        print(f"sample generation: CPU with {sample_num_workers} workers")
+    else:
+        print("sample generation: CUDA in the training process")
+    print("generating fixed validation records...")
+    eval_records = make_pde_records_with_workers(
         config.num_eval_pairs,
         seed_offset=config.eval_seed_offset,
-        sim_device=device,
+        sim_device=sample_sim_device,
         config=config,
+        num_workers=sample_num_workers,
     )
-    print(f"generated {len(train_records)} train records and {len(eval_records)} eval records")
+    print(f"generated {len(eval_records)} fixed eval records")
 
-    train_seeds, eval_seeds = assert_disjoint_record_splits(train_records, eval_records)
+    eval_seeds = {record["params"]["seed"] for record in eval_records}
     print(
-        f"train/eval split OK: {len(train_records)} train seeds "
-        f"{min(train_seeds)}..{max(train_seeds)}, {len(eval_records)} val seeds "
-        f"{min(eval_seeds)}..{max(eval_seeds)}"
+        f"validation seeds fixed at {min(eval_seeds)}..{max(eval_seeds)}; "
+        "streaming training skips that validation range"
     )
+    train_dataset = StreamingPdePairDataset(
+        config=config,
+        image_size=config.train_image_size,
+        seed_offset=config.train_seed_offset,
+        sim_device=sample_sim_device,
+        skip_seed_ranges=[(config.eval_seed_offset, config.eval_seed_offset + config.num_eval_pairs)],
+    )
+    train_loader_kwargs = {}
+    if sample_num_workers > 0:
+        train_loader_kwargs.update(
+            num_workers=sample_num_workers,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+        if device.type == "cuda":
+            train_loader_kwargs["pin_memory"] = True
     train_loader = DataLoader(
-        PdePairDataset(train_records, image_size=config.train_image_size),
+        train_dataset,
         batch_size=config.train_batch_size,
-        shuffle=True,
-        drop_last=True,
+        **train_loader_kwargs,
     )
 
     pipe = Flux2KleinPipeline.from_pretrained(config.model_id, torch_dtype=weight_dtype)
@@ -182,6 +368,46 @@ def run_training(config=None):
             "thermal AdaLN conditioning: "
             f"(log(alpha) - {config.heat_log_diffusivity_mean:.6g}) / {config.heat_log_diffusivity_std:.6g}"
         )
+    elif config.pde_kind == "elasticity":
+        scalar_modulation = attach_scalar_parameter_modulation(
+            pipe.transformer,
+            bottleneck_dim=config.thermal_modulation_bottleneck_dim,
+            parameter_names=config.elasticity_conditioning_names,
+            parameter_transforms=config.elasticity_conditioning_transforms,
+            normalization_mean=config.elasticity_conditioning_mean,
+            normalization_std=config.elasticity_conditioning_std,
+        )
+        scalar_modulation.to(device=device)
+        print(
+            "elasticity AdaLN conditioning: "
+            + ", ".join(
+                f"{name}:{transform}"
+                for name, transform in zip(
+                    config.elasticity_conditioning_names,
+                    config.elasticity_conditioning_transforms,
+                )
+            )
+        )
+    elif config.pde_kind == "fracture":
+        scalar_modulation = attach_scalar_parameter_modulation(
+            pipe.transformer,
+            bottleneck_dim=config.thermal_modulation_bottleneck_dim,
+            parameter_names=config.fracture_conditioning_names,
+            parameter_transforms=config.fracture_conditioning_transforms,
+            normalization_mean=config.fracture_conditioning_mean,
+            normalization_std=config.fracture_conditioning_std,
+        )
+        scalar_modulation.to(device=device)
+        print(
+            "fracture AdaLN conditioning: "
+            + ", ".join(
+                f"{name}:{transform}"
+                for name, transform in zip(
+                    config.fracture_conditioning_names,
+                    config.fracture_conditioning_transforms,
+                )
+            )
+        )
     else:
         print("scalar parameter conditioning: disabled")
 
@@ -199,8 +425,24 @@ def run_training(config=None):
         weight_decay=1e-4,
     )
 
+    if config.validation_num_images:
+        print("initial validation inference before training")
+        pipe.transformer.eval()
+        show_random_inference_grid(
+            pipe,
+            eval_records,
+            prompt_embeds,
+            text_ids,
+            device=device,
+            pde_name=config.pde_name,
+            train_image_size=config.train_image_size,
+            num_inference_steps=config.distilled_num_inference_steps,
+            n=config.validation_num_images,
+            seed=config.seed,
+        )
+
     pipe.transformer.train()
-    loader_iter = cycle(train_loader)
+    loader_iter = iter(train_loader)
     printed_schedule = False
     loss_history = []
     ema_loss = None
@@ -217,6 +459,9 @@ def run_training(config=None):
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
     )
     for global_step in progress:
+        current_lr = _cosine_decay_lr(config.learning_rate, global_step, config.max_train_steps)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
 
@@ -244,7 +489,10 @@ def run_training(config=None):
         else:
             ema_loss = ema_loss_decay * ema_loss + (1.0 - ema_loss_decay) * accumulated_loss
         progress.set_description(f"LoRA steps loss={accumulated_loss:.4f} ema={ema_loss:.4f}")
-        progress.set_postfix_str(f"loss={accumulated_loss:.4f} ema={ema_loss:.4f}", refresh=True)
+        progress.set_postfix_str(
+            f"loss={accumulated_loss:.4f} ema={ema_loss:.4f} lr={current_lr:.2e}",
+            refresh=True,
+        )
 
         if config.validate_every_n_steps and global_step > 0 and global_step % config.validate_every_n_steps == 0:
             progress.write(f"validation inference at step {global_step}")
@@ -271,6 +519,14 @@ def run_training(config=None):
     )
     if hasattr(pipe.transformer, "thermal_modulation"):
         torch.save(pipe.transformer.thermal_modulation.state_dict(), config.output_dir / "thermal_modulation.pt")
+        torch.save(
+            {
+                "state_dict": pipe.transformer.thermal_modulation.state_dict(),
+                "parameter_names": getattr(pipe.transformer.thermal_modulation, "parameter_names", ()),
+                "parameter_transforms": getattr(pipe.transformer.thermal_modulation, "parameter_transforms", ()),
+            },
+            config.output_dir / "scalar_modulation.pt",
+        )
     print(f"saved LoRA to {config.output_dir.resolve()}")
 
     show_random_inference_grid(
@@ -293,7 +549,8 @@ def run_training(config=None):
 
     return {
         "pipe": pipe,
-        "train_records": train_records,
+        "train_records": None,
+        "train_dataset": train_dataset,
         "eval_records": eval_records,
         "loss_history": loss_history,
         "prompt_embeds": prompt_embeds,
