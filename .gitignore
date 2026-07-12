@@ -6,3 +6,4 @@ dbnFiles/
 **/*.safetensors
 **/*.pt
 **/*.pth
+.venv*

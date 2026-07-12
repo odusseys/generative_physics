@@ -72,13 +72,6 @@ from .elliptic import (
     ELLIPTIC_REACTION_MIN,
 )
 from .flux_lora import flux2_klein_lora_targets, pde_lora_loss, trainable_parameter_count
-from .fourier import (
-    FOURIER_GAUSSIAN_SIGMA_MAX,
-    FOURIER_GAUSSIAN_SIGMA_MIN,
-    FOURIER_NUM_MODES,
-    FOURIER_SCALE,
-    FOURIER_SHIFT,
-)
 from .fracture import (
     FRACTURE_BIAXIAL_STRAIN_MAX,
     FRACTURE_BIAXIAL_STRAIN_MIN,
@@ -96,6 +89,16 @@ from .fracture import (
     FRACTURE_STEPS,
 )
 from .heat import HEAT_FORCING_NUM_MODES, HEAT_FORCING_SCALE
+from .ks import (
+    KS_BURN_T,
+    KS_CMAP_NAME,
+    KS_DOMAIN_LENGTH,
+    KS_DT,
+    KS_INITIAL_DECAY,
+    KS_INITIAL_NUM_MODES,
+    KS_STEPS_PER_FRAME,
+    KS_VALUE_BOUNDS,
+)
 from .ot import (
     OT_COST_PATH_SAMPLES,
     OT_COST_SIGMA_MULTIPLIER,
@@ -132,6 +135,10 @@ def _cosine_decay_lr(initial_lr, step, max_steps):
         return float(initial_lr)
     progress = min(max(float(step) / float(max_steps), 0.0), 1.0)
     return float(initial_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _stage(message):
+    print(message, flush=True)
 
 
 def print_parameter_report(pipe):
@@ -192,12 +199,12 @@ def run_training(config=None):
             "Poisson source: "
             f"{POISSON_NUM_GAUSSIAN_MODES} Gaussian modes, scale={POISSON_SOURCE_SCALE:g}"
         )
-    elif config.pde_kind == "fourier":
+    elif config.pde_kind == "ks":
         print(
-            "Fourier source: "
-            f"{FOURIER_NUM_MODES} random-covariance Gaussian modes, "
-            f"sigma={FOURIER_GAUSSIAN_SIGMA_MIN:g}..{FOURIER_GAUSSIAN_SIGMA_MAX:g}, "
-            f"scale={FOURIER_SCALE:g}, fft_shift={FOURIER_SHIFT}"
+            "Kuramoto-Sivashinsky: "
+            f"L={KS_DOMAIN_LENGTH:g}, dt={KS_DT:g}, burn_T={KS_BURN_T:g}, "
+            f"steps_per_frame={KS_STEPS_PER_FRAME}, init_modes={KS_INITIAL_NUM_MODES}, "
+            f"init_decay={KS_INITIAL_DECAY:g}, value_bounds={KS_VALUE_BOUNDS}, cmap={KS_CMAP_NAME}"
         )
     elif config.pde_kind == "airfoil":
         print(
@@ -275,7 +282,7 @@ def run_training(config=None):
             f"eps_high={FRACTURE_HIGH_STRAIN_MIN:g}..{FRACTURE_HIGH_STRAIN_MAX:g}, "
             f"eps_biaxial={FRACTURE_BIAXIAL_STRAIN_MIN:g}..{FRACTURE_BIAXIAL_STRAIN_MAX:g}, "
             f"defects={FRACTURE_MIN_DEFECTS}..{FRACTURE_MAX_DEFECTS}, "
-            f"steps={FRACTURE_STEPS}, inner_iters={FRACTURE_INNER_ITERS}"
+            f"steps={config.fracture_steps}, inner_iters={config.fracture_inner_iters}"
         )
     print(
         "training data: streaming fresh simulations on the fly "
@@ -322,13 +329,17 @@ def run_training(config=None):
         **train_loader_kwargs,
     )
 
+    _stage("loading Flux pipeline")
     pipe = Flux2KleinPipeline.from_pretrained(config.model_id, torch_dtype=weight_dtype)
+    _stage("pipeline loaded; moving pipeline to training device")
     pipe.to(device)
+    _stage("pipeline on device; freezing base modules")
     pipe.set_progress_bar_config(disable=True)
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.transformer.requires_grad_(False)
 
+    _stage("encoding prompt")
     with torch.no_grad():
         prompt_embeds, text_ids = pipe.encode_prompt(
             config.prompt,
@@ -339,10 +350,12 @@ def run_training(config=None):
     prompt_embeds = prompt_embeds.detach().to(device=device, dtype=weight_dtype)
     text_ids = text_ids.detach().to(device=device)
 
+    _stage("prompt encoded; moving text encoder to CPU")
     pipe.text_encoder.to("cpu")
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    _stage("attaching LoRA adapters")
     lora_config = LoraConfig(
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,
@@ -412,6 +425,7 @@ def run_training(config=None):
         print("scalar parameter conditioning: disabled")
 
     if hasattr(pipe.transformer, "enable_gradient_checkpointing"):
+        _stage("enabling gradient checkpointing")
         pipe.transformer.enable_gradient_checkpointing()
 
     trainable, total = trainable_parameter_count(pipe.transformer)
@@ -425,7 +439,7 @@ def run_training(config=None):
         weight_decay=1e-4,
     )
 
-    if config.validation_num_images:
+    if config.run_initial_validation and config.validation_num_images:
         print("initial validation inference before training")
         pipe.transformer.eval()
         show_random_inference_grid(

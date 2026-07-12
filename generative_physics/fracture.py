@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image
@@ -7,39 +8,39 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 
 
-FRACTURE_GRID_SIZE = 56
+FRACTURE_GRID_SIZE = 128
 FRACTURE_E = 1.0
 FRACTURE_NU_MIN = 0.18
 FRACTURE_NU_MAX = 0.35
 FRACTURE_GC_MIN = 7e-5
 FRACTURE_GC_MAX = 2.2e-4
 FRACTURE_MIN_DEFECTS = 0
-FRACTURE_MAX_DEFECTS = 5
+FRACTURE_MAX_DEFECTS = 0
 FRACTURE_MAIN_CRACK_Y_MIN = 0.2
 FRACTURE_MAIN_CRACK_Y_MAX = 0.8
-FRACTURE_MAIN_CRACK_MIN_SEGMENTS = 2
-FRACTURE_MAIN_CRACK_MAX_SEGMENTS = 5
-FRACTURE_MAIN_CRACK_TOTAL_LENGTH_MIN = 0.14
-FRACTURE_MAIN_CRACK_TOTAL_LENGTH_MAX = 0.30
-FRACTURE_MAIN_CRACK_INITIAL_THETA_STD = 0.10
-FRACTURE_MAIN_CRACK_THETA_STEP_STD = 0.20
-FRACTURE_MAIN_CRACK_THETA_MIN = -0.7
-FRACTURE_MAIN_CRACK_THETA_MAX = 0.7
-FRACTURE_MAIN_CRACK_WIDTH_PX = 0.36
+FRACTURE_MAIN_CRACK_MIN_SEGMENTS = 4
+FRACTURE_MAIN_CRACK_MAX_SEGMENTS = 9
+FRACTURE_MAIN_CRACK_TOTAL_LENGTH_MIN = 0.12
+FRACTURE_MAIN_CRACK_TOTAL_LENGTH_MAX = 0.42
+FRACTURE_MAIN_CRACK_INITIAL_THETA_STD = 0.28
+FRACTURE_MAIN_CRACK_THETA_STEP_STD = 0.55
+FRACTURE_MAIN_CRACK_THETA_MIN = -1.2
+FRACTURE_MAIN_CRACK_THETA_MAX = 1.2
+FRACTURE_MAIN_CRACK_WIDTH_PX = 0.70
 FRACTURE_DEFECT_CRACK_MIN_SEGMENTS = 1
 FRACTURE_DEFECT_CRACK_MAX_SEGMENTS = 3
 FRACTURE_DEFECT_CRACK_TOTAL_LENGTH_MIN = 0.025
 FRACTURE_DEFECT_CRACK_TOTAL_LENGTH_MAX = 0.08
 FRACTURE_DEFECT_CRACK_THETA_STEP_STD = 0.35
 FRACTURE_DEFECT_CRACK_WIDTH_PX = 0.28
-FRACTURE_LOW_STRAIN_MIN = 0.006
-FRACTURE_LOW_STRAIN_MAX = 0.022
-FRACTURE_HIGH_STRAIN_MIN = 0.055
-FRACTURE_HIGH_STRAIN_MAX = 0.082
-FRACTURE_BIAXIAL_STRAIN_MIN = 0.035
-FRACTURE_BIAXIAL_STRAIN_MAX = 0.060
-FRACTURE_STEPS = 18
-FRACTURE_INNER_ITERS = 3
+FRACTURE_LOW_STRAIN_MIN = 0.010
+FRACTURE_LOW_STRAIN_MAX = 0.030
+FRACTURE_HIGH_STRAIN_MIN = 0.075
+FRACTURE_HIGH_STRAIN_MAX = 0.115
+FRACTURE_BIAXIAL_STRAIN_MIN = 0.055
+FRACTURE_BIAXIAL_STRAIN_MAX = 0.090
+FRACTURE_STEPS = 4
+FRACTURE_INNER_ITERS = 2
 FRACTURE_ELL_FACTOR = 1.7
 FRACTURE_KAPPA = 1e-6
 FRACTURE_DAMAGE_VMIN = 0.0
@@ -158,16 +159,7 @@ def random_initial_damage_with_defects(rng, n):
         n=n,
         width_px=FRACTURE_MAIN_CRACK_WIDTH_PX,
     )
-    num_defects = int(rng.integers(FRACTURE_MIN_DEFECTS, FRACTURE_MAX_DEFECTS + 1))
-
-    for _ in range(num_defects):
-        defect = rasterize_polyline(
-            random_internal_piecewise_crack(rng),
-            n=n,
-            width_px=FRACTURE_DEFECT_CRACK_WIDTH_PX,
-        )
-        damage = np.maximum(damage, defect)
-
+    num_defects = 0
     return damage, num_defects
 
 
@@ -245,10 +237,59 @@ def tri_B_area(coords_e):
     return B, grads, area
 
 
-def precompute_fe(n, E=FRACTURE_E, nu=0.3):
+@lru_cache(maxsize=8)
+def _precompute_fe_geometry(n):
     coords, elems = make_mesh(n)
     nn = coords.shape[0]
     ndof = 2 * nn
+
+    tri_coords = coords[elems]
+    x = tri_coords[:, :, 0]
+    y = tri_coords[:, :, 1]
+    det = (x[:, 1] - x[:, 0]) * (y[:, 2] - y[:, 0]) - (x[:, 2] - x[:, 0]) * (y[:, 1] - y[:, 0])
+    area = 0.5 * np.abs(det)
+    bx = np.column_stack((y[:, 1] - y[:, 2], y[:, 2] - y[:, 0], y[:, 0] - y[:, 1])) / det[:, None]
+    by = np.column_stack((x[:, 2] - x[:, 1], x[:, 0] - x[:, 2], x[:, 1] - x[:, 0])) / det[:, None]
+    grads = np.stack((bx, by), axis=2)
+
+    B = np.zeros((elems.shape[0], 3, 6))
+    B[:, 0, 0::2] = bx
+    B[:, 1, 1::2] = by
+    B[:, 2, 0::2] = by
+    B[:, 2, 1::2] = bx
+
+    elem_dofs = np.empty((elems.shape[0], 6), dtype=np.int64)
+    elem_dofs[:, 0::2] = 2 * elems
+    elem_dofs[:, 1::2] = 2 * elems + 1
+    erows = np.repeat(elem_dofs, 6, axis=1).ravel()
+    ecols = np.tile(elem_dofs, (1, 6)).ravel()
+
+    Kgrad_local = area[:, None, None] * np.einsum("eik,ejk->eij", grads, grads)
+    drows = np.repeat(elems, 3, axis=1).ravel()
+    dcols = np.tile(elems, (1, 3)).ravel()
+    ddata = Kgrad_local.ravel()
+    Kgrad = coo_matrix((ddata, (drows, dcols)), shape=(nn, nn)).tocsr()
+
+    mass = np.zeros(nn)
+    np.add.at(mass, elems.ravel(), np.repeat(area / 3.0, 3))
+
+    return {
+        "n": n,
+        "elem_nodes": elems,
+        "elem_dofs": elem_dofs,
+        "B": B,
+        "area": area,
+        "erows": erows,
+        "ecols": ecols,
+        "Kgrad": Kgrad,
+        "mass": mass,
+        "ndof": ndof,
+        "nn": nn,
+    }
+
+
+def precompute_fe(n, E=FRACTURE_E, nu=0.3):
+    geometry = _precompute_fe_geometry(int(n))
     C = E / (1.0 - nu**2) * np.array(
         [
             [1.0, nu, 0.0],
@@ -256,61 +297,11 @@ def precompute_fe(n, E=FRACTURE_E, nu=0.3):
             [0.0, 0.0, (1.0 - nu) / 2.0],
         ]
     )
-
-    erows = []
-    ecols = []
-    edata = []
-    drows = []
-    dcols = []
-    ddata = []
-    mass = np.zeros(nn)
-    elem_nodes = []
-    elem_dofs = []
-    B_list = []
-    area_list = []
-
-    for nodes in elems:
-        B, grads, area = tri_B_area(coords[nodes])
-        Ke = area * (B.T @ C @ B)
-        dofs = []
-        for node in nodes:
-            dofs += [2 * node, 2 * node + 1]
-
-        elem_nodes.append(nodes)
-        elem_dofs.append(dofs)
-        B_list.append(B)
-        area_list.append(area)
-
-        for a in range(6):
-            for b in range(6):
-                erows.append(dofs[a])
-                ecols.append(dofs[b])
-                edata.append(Ke[a, b])
-
-        Kg = area * (grads @ grads.T)
-        for a in range(3):
-            mass[nodes[a]] += area / 3.0
-            for b in range(3):
-                drows.append(nodes[a])
-                dcols.append(nodes[b])
-                ddata.append(Kg[a, b])
-
-    Kgrad = coo_matrix((ddata, (drows, dcols)), shape=(nn, nn)).tocsr()
-    return {
-        "n": n,
-        "C": C,
-        "elem_nodes": np.array(elem_nodes),
-        "elem_dofs": np.array(elem_dofs),
-        "B": np.array(B_list),
-        "area": np.array(area_list),
-        "erows": np.array(erows),
-        "ecols": np.array(ecols),
-        "edata": np.array(edata),
-        "Kgrad": Kgrad,
-        "mass": mass,
-        "ndof": ndof,
-        "nn": nn,
-    }
+    Ke = geometry["area"][:, None, None] * np.einsum("eki,kl,elj->eij", geometry["B"], C, geometry["B"])
+    pre = dict(geometry)
+    pre["C"] = C
+    pre["edata"] = Ke.ravel()
+    return pre
 
 
 def assemble_elastic(d, pre, kappa=FRACTURE_KAPPA):

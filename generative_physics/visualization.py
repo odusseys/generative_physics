@@ -55,8 +55,8 @@ def _default_condition_name(record):
         return r"initial $u_0$"
     if pde == "poisson":
         return r"source $f$"
-    if pde == "fourier":
-        return r"input $u$"
+    if pde == "ks":
+        return r"initial $u_0$"
     if pde == "airfoil":
         return "airfoil mask"
     if pde == "elasticity":

@@ -4,6 +4,9 @@ import math
 
 import torch
 
+from .fracture import FRACTURE_GRID_SIZE, FRACTURE_INNER_ITERS, FRACTURE_STEPS
+from .ks import KS_GRID_SIZE
+
 
 @dataclass
 class TrainingConfig:
@@ -21,6 +24,8 @@ class TrainingConfig:
     stream_chunk_size: int = 8
     sim_progress_update_every: int = 8
 
+    ks_grid_size: int = KS_GRID_SIZE
+
     elliptic_grid_size: int = 256
     elliptic_cache_dir: str = "/home/ubuntu/datasets/elliptic"
 
@@ -30,13 +35,13 @@ class TrainingConfig:
 
     poisson_grid_size: int = 256
 
-    fourier_grid_size: int = 256
-
     airfoil_grid_size: int = 256
 
     elasticity_grid_size: int = 256
 
-    fracture_grid_size: int = 56
+    fracture_grid_size: int = FRACTURE_GRID_SIZE
+    fracture_steps: int = FRACTURE_STEPS
+    fracture_inner_iters: int = FRACTURE_INNER_ITERS
 
     num_eval_pairs: int = 24
     train_seed_offset: int = 10_000
@@ -46,6 +51,7 @@ class TrainingConfig:
     max_train_steps: int = 10000
     validate_every_n_steps: int = 100
     validation_num_images: int = 8
+    run_initial_validation: bool = True
     loss_ema_alpha: float = 0.03
 
     learning_rate: float = 1e-4
@@ -58,6 +64,13 @@ class TrainingConfig:
     text_encoder_out_layers: tuple[int, int, int] = (9, 18, 27)
     seed: int = 1234
 
+    def __post_init__(self):
+        if self.pde_kind == "ks":
+            if self.train_image_size == 256:
+                self.train_image_size = self.ks_grid_size
+            if self.output_image_size == 256:
+                self.output_image_size = self.ks_grid_size
+
     @property
     def pde_name(self) -> str:
         if self.pde_kind == "heat":
@@ -68,8 +81,8 @@ class TrainingConfig:
             return "Burgers"
         if self.pde_kind == "poisson":
             return "Poisson"
-        if self.pde_kind == "fourier":
-            return "Fourier Transform"
+        if self.pde_kind == "ks":
+            return "Kuramoto-Sivashinsky"
         if self.pde_kind == "airfoil":
             return "Airfoil Potential Flow"
         if self.pde_kind == "elliptic":
@@ -83,8 +96,8 @@ class TrainingConfig:
         if self.pde_kind == "fracture":
             return "Phase-Field Fracture"
         raise ValueError(
-            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
-            "'fourier', 'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
+            f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'ks', "
+            "'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
         )
 
     @property
@@ -100,12 +113,10 @@ class TrainingConfig:
             )
         if self.pde_kind == "poisson":
             return "Given the 2D Poisson source image, generate the zero-boundary Poisson solution image."
-        if self.pde_kind == "fourier":
-            from .fourier import FOURIER_NUM_MODES
-
+        if self.pde_kind == "ks":
             return (
-                f"Given a scalar function image with {FOURIER_NUM_MODES} random-covariance Gaussian modes, "
-                "generate the log magnitude of its 2D Fourier transform."
+                "Given the initial Kuramoto-Sivashinsky state image, "
+                "generate the future space-time trajectory image."
             )
         if self.pde_kind == "airfoil":
             return "Given the no-flow airfoil image in uniform rightward flow, generate the potential-flow image."
@@ -251,7 +262,7 @@ class TrainingConfig:
 
     @property
     def sim_batch_size(self) -> int:
-        if self.pde_kind in {"poisson", "fourier"}:
+        if self.pde_kind == "poisson":
             return 32 if torch.cuda.is_available() else 1
         if self.pde_kind in {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture"}:
             return 1

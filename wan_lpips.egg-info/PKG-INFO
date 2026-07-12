@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: wan-lpips
+Version: 0.1.0
+Summary: Wan2.2 latent perceptual-metric training and video augmentations
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: torch
+Provides-Extra: video
+Requires-Dist: av; extra == "video"
+Requires-Dist: ipython; extra == "video"
+Requires-Dist: pillow; extra == "video"
+Provides-Extra: training
+Requires-Dist: matplotlib; extra == "training"
+Requires-Dist: safetensors; extra == "training"
+Requires-Dist: torchvision; extra == "training"
+Requires-Dist: tqdm; extra == "training"

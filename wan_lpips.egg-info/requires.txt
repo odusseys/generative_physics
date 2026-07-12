@@ -1,0 +1,13 @@
+numpy
+torch
+
+[training]
+matplotlib
+safetensors
+torchvision
+tqdm
+
+[video]
+av
+ipython
+pillow

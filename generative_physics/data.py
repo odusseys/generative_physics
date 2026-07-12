@@ -12,15 +12,15 @@ from .config import TrainingConfig
 from .elliptic import generate_elliptic_image_pairs
 from .eikonal import generate_eikonal_image_pairs
 from .elasticity import generate_elasticity_image_pairs
-from .fourier import generate_fourier_image_pairs
 from .fracture import generate_fracture_image_pairs
 from .heat import generate_heat_image_pairs
+from .ks import generate_ks_image_pairs
 from .ot import generate_ot_image_pairs
 from .poisson import generate_poisson_image_pairs
 from .rendering import rgb_image_to_model_tensor
 
 
-CPU_ONLY_PDE_KINDS = {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture"}
+CPU_ONLY_PDE_KINDS = {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture", "ks"}
 
 
 def simulations_run_on_cpu(config=None, sim_device=None):
@@ -46,8 +46,8 @@ def cpu_sim_worker_count(config=None, num_pairs=None):
 def simulation_grid_size(config):
     if config.pde_kind == "poisson":
         return config.poisson_grid_size
-    if config.pde_kind == "fourier":
-        return config.fourier_grid_size
+    if config.pde_kind == "ks":
+        return config.ks_grid_size
     if config.pde_kind == "airfoil":
         return config.airfoil_grid_size
     if config.pde_kind == "elliptic":
@@ -154,6 +154,8 @@ def make_pde_records(
             seeds,
             sim_nx=sim_nx,
             output_size=image_size,
+            steps=config.fracture_steps,
+            inner_iters=config.fracture_inner_iters,
         )
         for solution_img, initial_img, params in pairs:
             records.append({"initial": initial_img, "solution": solution_img, "params": params})
@@ -216,8 +218,8 @@ def make_pde_records(
                 output_size=image_size,
                 sim_device=sim_device,
             )
-        elif config.pde_kind == "fourier":
-            pairs = generate_fourier_image_pairs(
+        elif config.pde_kind == "ks":
+            pairs = generate_ks_image_pairs(
                 seed_chunk,
                 sim_nx=sim_nx,
                 output_size=image_size,
@@ -225,8 +227,8 @@ def make_pde_records(
             )
         else:
             raise ValueError(
-                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', "
-                "'fourier', 'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
+                f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'ks', "
+                "'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
             )
 
         for pair in pairs:

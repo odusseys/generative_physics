@@ -1,4 +1,4 @@
-from pde_flux_lora import TrainingConfig, run_training
+from generative_physics import TrainingConfig, run_training
 
 
 if __name__ == "__main__":
