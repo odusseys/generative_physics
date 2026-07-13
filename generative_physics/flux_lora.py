@@ -11,7 +11,17 @@ from .rendering import image_size_xy, rgb_image_to_model_tensor
 
 def flux2_klein_lora_targets(transformer):
     n_single = len(transformer.single_transformer_blocks)
-    return ["to_k", "to_q", "to_v", "to_out.0", "to_qkv_mlp_proj"] + [
+    return [
+        "to_k",
+        "to_q",
+        "to_v",
+        "to_out.0",
+        "to_qkv_mlp_proj",
+        "ff.linear_in",
+        "ff.linear_out",
+        "x_embedder",
+        "proj_out",
+    ] + [
         f"single_transformer_blocks.{i}.attn.to_out" for i in range(min(24, n_single))
     ]
 
@@ -261,7 +271,7 @@ def infer_solution(
     latents = latents * latents_bn_std + latents_bn_mean
     latents = Flux2KleinPipeline._unpatchify_latents(latents)
     image = pipe.vae.decode(latents, return_dict=False)[0]
-    image = pipe.image_processor.postprocess(image, output_type="pil")[0]
+    image = pipe.image_processor.postprocess(image, output_type="np")[0]
 
     if was_training:
         pipe.transformer.train()

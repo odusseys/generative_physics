@@ -47,7 +47,7 @@ def simulation_grid_size(config):
     if config.pde_kind == "poisson":
         return config.poisson_grid_size
     if config.pde_kind == "ks":
-        return config.ks_grid_size
+        return max(config.ks_grid_size, config.output_image_size)
     if config.pde_kind == "airfoil":
         return config.airfoil_grid_size
     if config.pde_kind == "elliptic":
@@ -223,6 +223,7 @@ def make_pde_records(
                 seed_chunk,
                 sim_nx=sim_nx,
                 output_size=image_size,
+                condition_encoding=config.ks_condition_encoding,
                 sim_device=sim_device,
             )
         else:

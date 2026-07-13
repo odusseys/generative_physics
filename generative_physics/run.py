@@ -2,6 +2,7 @@ import gc
 import math
 import random
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -93,11 +94,12 @@ from .ks import (
     KS_BURN_T,
     KS_CMAP_NAME,
     KS_DOMAIN_LENGTH,
-    KS_DT,
+    KS_HORIZON_T,
     KS_INITIAL_DECAY,
     KS_INITIAL_NUM_MODES,
     KS_STEPS_PER_FRAME,
     KS_VALUE_BOUNDS,
+    ks_effective_discretization,
 )
 from .ot import (
     OT_COST_PATH_SAMPLES,
@@ -117,7 +119,7 @@ from .ot import (
 )
 from .poisson import POISSON_NUM_GAUSSIAN_MODES, POISSON_SOURCE_SCALE
 from .thermal_modulation import attach_scalar_parameter_modulation, attach_thermal_coefficient_modulation
-from .visualization import show_random_inference_grid, show_smoothed_loss
+from .visualization import show_ks_timewise_error, show_random_inference_grid, show_smoothed_loss
 
 
 def _count_parameters(parameters):
@@ -139,6 +141,33 @@ def _cosine_decay_lr(initial_lr, step, max_steps):
 
 def _stage(message):
     print(message, flush=True)
+
+
+def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, config, seed):
+    show_random_inference_grid(
+        pipe,
+        records,
+        prompt_embeds,
+        text_ids,
+        device=device,
+        pde_name=config.pde_name,
+        train_image_size=config.train_image_size,
+        num_inference_steps=config.distilled_num_inference_steps,
+        n=config.validation_num_images,
+        seed=seed,
+    )
+    if config.pde_kind == "ks" and config.ks_debug_num_samples:
+        show_ks_timewise_error(
+            pipe,
+            records,
+            prompt_embeds,
+            text_ids,
+            device=device,
+            train_image_size=config.train_image_size,
+            num_inference_steps=config.distilled_num_inference_steps,
+            n=config.ks_debug_num_samples,
+            seed=seed,
+        )
 
 
 def print_parameter_report(pipe):
@@ -169,7 +198,7 @@ def print_parameter_report(pipe):
     print(f"    text encoder: {frozen_text_encoder:,}")
 
 
-def run_training(config=None):
+def run_training(config=None, vae_lora_checkpoint=None):
     config = config or TrainingConfig()
     torch.manual_seed(config.seed)
     random.seed(config.seed)
@@ -200,11 +229,17 @@ def run_training(config=None):
             f"{POISSON_NUM_GAUSSIAN_MODES} Gaussian modes, scale={POISSON_SOURCE_SCALE:g}"
         )
     elif config.pde_kind == "ks":
+        ks_nx, ks_time_frames, ks_dt = ks_effective_discretization(
+            Nx=config.ks_grid_size,
+            image_size=config.output_image_size,
+        )
         print(
             "Kuramoto-Sivashinsky: "
-            f"L={KS_DOMAIN_LENGTH:g}, dt={KS_DT:g}, burn_T={KS_BURN_T:g}, "
+            f"L={KS_DOMAIN_LENGTH:g}, grid={ks_nx}, frames={ks_time_frames}, dt={ks_dt:g}, "
+            f"burn_T={KS_BURN_T:g}, horizon_T={KS_HORIZON_T:g}, "
             f"steps_per_frame={KS_STEPS_PER_FRAME}, init_modes={KS_INITIAL_NUM_MODES}, "
-            f"init_decay={KS_INITIAL_DECAY:g}, value_bounds={KS_VALUE_BOUNDS}, cmap={KS_CMAP_NAME}"
+            f"init_decay={KS_INITIAL_DECAY:g}, condition={config.ks_condition_encoding}, "
+            f"value_bounds={KS_VALUE_BOUNDS}, cmap={KS_CMAP_NAME}"
         )
     elif config.pde_kind == "airfoil":
         print(
@@ -292,9 +327,12 @@ def run_training(config=None):
         print(f"sample generation: CPU with {sample_num_workers} workers")
     else:
         print("sample generation: CUDA in the training process")
+    eval_pair_count = config.num_eval_pairs
+    if config.pde_kind == "ks":
+        eval_pair_count = max(eval_pair_count, config.ks_debug_num_samples)
     print("generating fixed validation records...")
     eval_records = make_pde_records_with_workers(
-        config.num_eval_pairs,
+        eval_pair_count,
         seed_offset=config.eval_seed_offset,
         sim_device=sample_sim_device,
         config=config,
@@ -312,7 +350,7 @@ def run_training(config=None):
         image_size=config.train_image_size,
         seed_offset=config.train_seed_offset,
         sim_device=sample_sim_device,
-        skip_seed_ranges=[(config.eval_seed_offset, config.eval_seed_offset + config.num_eval_pairs)],
+        skip_seed_ranges=[(config.eval_seed_offset, config.eval_seed_offset + eval_pair_count)],
     )
     train_loader_kwargs = {}
     if sample_num_workers > 0:
@@ -331,6 +369,18 @@ def run_training(config=None):
 
     _stage("loading Flux pipeline")
     pipe = Flux2KleinPipeline.from_pretrained(config.model_id, torch_dtype=weight_dtype)
+    if vae_lora_checkpoint is not None:
+        vae_lora_checkpoint = Path(vae_lora_checkpoint).expanduser().resolve()
+        if not vae_lora_checkpoint.is_file():
+            raise FileNotFoundError(f"VAE LoRA checkpoint not found: {vae_lora_checkpoint}")
+        _stage(f"loading VAE LoRA from {vae_lora_checkpoint}")
+        pipe.vae.load_lora_adapter(
+            vae_lora_checkpoint.parent,
+            weight_name=vae_lora_checkpoint.name,
+            prefix=None,
+            adapter_name="vae_finetune",
+            low_cpu_mem_usage=True,
+        )
     _stage("pipeline loaded; moving pipeline to training device")
     pipe.to(device)
     _stage("pipeline on device; freezing base modules")
@@ -442,17 +492,14 @@ def run_training(config=None):
     if config.run_initial_validation and config.validation_num_images:
         print("initial validation inference before training")
         pipe.transformer.eval()
-        show_random_inference_grid(
+        _show_validation_debug(
             pipe,
             eval_records,
             prompt_embeds,
             text_ids,
-            device=device,
-            pde_name=config.pde_name,
-            train_image_size=config.train_image_size,
-            num_inference_steps=config.distilled_num_inference_steps,
-            n=config.validation_num_images,
-            seed=config.seed,
+            device,
+            config,
+            config.seed,
         )
 
     pipe.transformer.train()
@@ -510,17 +557,14 @@ def run_training(config=None):
 
         if config.validate_every_n_steps and global_step > 0 and global_step % config.validate_every_n_steps == 0:
             progress.write(f"validation inference at step {global_step}")
-            show_random_inference_grid(
+            _show_validation_debug(
                 pipe,
                 eval_records,
                 prompt_embeds,
                 text_ids,
-                device=device,
-                pde_name=config.pde_name,
-                train_image_size=config.train_image_size,
-                num_inference_steps=config.distilled_num_inference_steps,
-                n=config.validation_num_images,
-                seed=config.seed + global_step,
+                device,
+                config,
+                config.seed + global_step,
             )
             show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)
 
@@ -543,17 +587,14 @@ def run_training(config=None):
         )
     print(f"saved LoRA to {config.output_dir.resolve()}")
 
-    show_random_inference_grid(
+    _show_validation_debug(
         pipe,
         eval_records,
         prompt_embeds,
         text_ids,
-        device=device,
-        pde_name=config.pde_name,
-        train_image_size=config.train_image_size,
-        num_inference_steps=config.distilled_num_inference_steps,
-        n=config.validation_num_images,
-        seed=config.seed,
+        device,
+        config,
+        config.seed,
     )
     show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)
 

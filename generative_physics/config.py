@@ -5,7 +5,7 @@ import math
 import torch
 
 from .fracture import FRACTURE_GRID_SIZE, FRACTURE_INNER_ITERS, FRACTURE_STEPS
-from .ks import KS_GRID_SIZE
+from .ks import KS_CONDITION_ENCODING, KS_GRID_SIZE, KS_RENDER_SIZE
 
 
 @dataclass
@@ -25,6 +25,8 @@ class TrainingConfig:
     sim_progress_update_every: int = 8
 
     ks_grid_size: int = KS_GRID_SIZE
+    ks_condition_encoding: str = KS_CONDITION_ENCODING
+    ks_debug_num_samples: int = 50
 
     elliptic_grid_size: int = 256
     elliptic_cache_dir: str = "/home/ubuntu/datasets/elliptic"
@@ -54,8 +56,8 @@ class TrainingConfig:
     run_initial_validation: bool = True
     loss_ema_alpha: float = 0.03
 
-    learning_rate: float = 1e-4
-    lora_rank: int = 16
+    learning_rate: float = 3e-5
+    lora_rank: int = 32
     lora_dropout: float = 0.0
     thermal_modulation_bottleneck_dim: int = 64
 
@@ -66,10 +68,14 @@ class TrainingConfig:
 
     def __post_init__(self):
         if self.pde_kind == "ks":
+            if self.ks_condition_encoding not in {"hilbert", "y_constant"}:
+                raise ValueError(
+                    "ks_condition_encoding must be 'hilbert' or 'y_constant'."
+                )
             if self.train_image_size == 256:
-                self.train_image_size = self.ks_grid_size
+                self.train_image_size = KS_RENDER_SIZE
             if self.output_image_size == 256:
-                self.output_image_size = self.ks_grid_size
+                self.output_image_size = KS_RENDER_SIZE
 
     @property
     def pde_name(self) -> str:
@@ -106,43 +112,7 @@ class TrainingConfig:
 
     @property
     def prompt(self) -> str:
-        if self.pde_kind == "heat":
-            return (
-                "Given the initial 1D Heat condition image, forcing image, and thermal diffusivity coefficient, "
-                "generate the Heat time-evolution image."
-            )
-        if self.pde_kind == "poisson":
-            return "Given the 2D Poisson source image, generate the zero-boundary Poisson solution image."
-        if self.pde_kind == "ks":
-            return (
-                "Given the initial Kuramoto-Sivashinsky state image, "
-                "generate the future space-time trajectory image."
-            )
-        if self.pde_kind == "airfoil":
-            return "Given the no-flow airfoil image in uniform rightward flow, generate the potential-flow image."
-        if self.pde_kind == "elliptic":
-            return (
-                "Given seven 2D variable-coefficient elliptic PDE images for a20, a11, a02, a10, a01, a00, "
-                "and forcing f, generate the zero-boundary solution image."
-            )
-        if self.pde_kind == "elasticity":
-            return (
-                "Given a binary mask image of a random hole in an elastic plate plus material and biaxial "
-                "far-field stress scalars, generate the stress field image."
-            )
-        if self.pde_kind == "eikonal":
-            return "Given a 2D refractive index image, generate the center-source eikonal propagation time image."
-        if self.pde_kind == "ot":
-            return (
-                "Given source distribution, target distribution, and transport cost images, "
-                "generate the entropic optimal transport source potential image."
-            )
-        if self.pde_kind == "fracture":
-            return (
-                "Given an initial phase-field crack damage image plus material and biaxial strain scalars, "
-                "generate the final fracture damage image."
-            )
-        return f"Given the initial 1D {self.pde_name} condition image, generate the {self.pde_name} time-evolution image."
+        return ""
 
     @property
     def lora_alpha(self) -> int:

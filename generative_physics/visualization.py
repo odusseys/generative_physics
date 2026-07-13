@@ -3,9 +3,11 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display
+from tqdm.auto import tqdm
 
 from .flux_lora import infer_solution
-from .rendering import as_float_rgb, as_pil_image
+from .ks import KS_CMAP_NAME, KS_DT, KS_STEPS_PER_FRAME, flame_image_to_normalized_array
+from .rendering import as_float_rgb, image_size_xy, resize_float_rgb
 
 
 VARIABLE_LABELS = {
@@ -109,10 +111,10 @@ def _record_condition_images_and_names(record):
         return list(condition_images), names
 
     initial_name = _default_condition_name(record)
-    images = [as_pil_image(record["initial"])]
+    images = [record["initial"]]
     names = [initial_name]
     if "forcing" in record:
-        images.append(as_pil_image(record["forcing"]))
+        images.append(record["forcing"])
         names.append(COLUMN_LABELS["forcing"])
     return images, names
 
@@ -234,7 +236,6 @@ def show_random_inference_grid(
     ) in enumerate(row_contexts):
         ground_truth = record["solution"]
         ground_truth_rgb = as_float_rgb(ground_truth)
-        ground_truth_pil = as_pil_image(ground_truth)
         generated = infer_solution(
             pipe,
             condition_images[0],
@@ -249,7 +250,7 @@ def show_random_inference_grid(
             condition_images=condition_images,
         )
 
-        gen_arr = as_float_rgb(generated.resize(ground_truth_pil.size))
+        gen_arr = resize_float_rgb(as_float_rgb(generated), ground_truth_rgb.shape[:2])
         gt_arr = ground_truth_rgb
         abs_error = np.abs(gen_arr - gt_arr).mean(axis=2)
 
@@ -261,7 +262,7 @@ def show_random_inference_grid(
         while col < max_conditions:
             axes[row, col].set_axis_off()
             col += 1
-        axes[row, col].imshow(generated)
+        axes[row, col].imshow(as_float_rgb(generated))
         _style_image_axis(axes[row, col])
         col += 1
         axes[row, col].imshow(ground_truth_rgb)
@@ -281,6 +282,58 @@ def show_random_inference_grid(
             )
     display(fig)
     plt.close(fig)
+
+
+def show_ks_timewise_error(
+    pipe,
+    records,
+    prompt_embeds,
+    text_ids,
+    device,
+    train_image_size=256,
+    num_inference_steps=4,
+    n=50,
+    seed=0,
+):
+    chosen = random.Random(seed).sample(records, k=min(n, len(records)))
+    if not chosen:
+        return np.array([], dtype=np.float32)
+
+    errors = []
+    for sample_index, record in enumerate(tqdm(chosen, desc="KS error samples", leave=False)):
+        condition_images, _ = _record_condition_images_and_names(record)
+        generated = infer_solution(
+            pipe,
+            condition_images[0],
+            prompt_embeds,
+            text_ids,
+            device=device,
+            train_image_size=train_image_size,
+            num_inference_steps=num_inference_steps,
+            seed=seed + sample_index,
+            condition_images=condition_images,
+        )
+        ground_truth = record["solution"]
+        target_size = image_size_xy(ground_truth)
+        generated = resize_float_rgb(as_float_rgb(generated), (target_size[1], target_size[0]))
+        generated_values = flame_image_to_normalized_array(generated, cmap_name=KS_CMAP_NAME)
+        target_values = flame_image_to_normalized_array(ground_truth, cmap_name=KS_CMAP_NAME)
+        errors.append(np.abs(generated_values - target_values).mean(axis=1))
+
+    mean_error = np.stack(errors).mean(axis=0)
+    dt = float(chosen[0]["params"].get("dt", KS_DT))
+    steps_per_frame = int(chosen[0]["params"].get("steps_per_frame", KS_STEPS_PER_FRAME))
+    times = np.arange(mean_error.size) * dt * steps_per_frame
+    fig, ax = plt.subplots(figsize=(8, 3.2))
+    ax.plot(times, mean_error, color="tab:red", linewidth=2.0)
+    ax.set_title(f"KS decoded absolute error over {len(chosen)} samples")
+    ax.set_xlabel("time")
+    ax.set_ylabel("mean absolute error")
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
+    return mean_error
 
 
 def exponential_moving_average(values, alpha=0.08):
