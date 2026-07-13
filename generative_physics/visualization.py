@@ -3,9 +3,10 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display
+from matplotlib.lines import Line2D
 from tqdm.auto import tqdm
 
-from .flux_lora import infer_solution
+from .flux_lora import infer_joint_solutions, infer_solution
 from .ks import KS_CMAP_NAME, KS_DT, KS_STEPS_PER_FRAME, flame_image_to_normalized_array
 from .rendering import as_float_rgb, image_size_xy, resize_float_rgb
 
@@ -13,6 +14,8 @@ from .rendering import as_float_rgb, image_size_xy, resize_float_rgb
 VARIABLE_LABELS = {
     "alpha": r"$\alpha$",
     "thermal_diffusivity": r"$\alpha$",
+    "density": r"$\rho$",
+    "kinematic_viscosity": r"$\nu$",
     "lambda": r"$\lambda$",
     "mu": r"$\mu$",
     "sigma_x": r"$\sigma_x$",
@@ -59,6 +62,8 @@ def _default_condition_name(record):
         return r"source $f$"
     if pde == "ks":
         return r"initial $u_0$"
+    if pde in {"navier_stokes", "navier_stokes_multiple"}:
+        return r"initial velocity $\mathbf{u}_0$"
     if pde == "airfoil":
         return "airfoil mask"
     if pde == "elasticity":
@@ -280,6 +285,97 @@ def show_random_inference_grid(
                 ha="left",
                 va="center",
             )
+    display(fig)
+    plt.close(fig)
+
+
+def show_navier_stokes_multiple_inference_grid(
+    pipe,
+    records,
+    prompt_embeds,
+    text_ids,
+    device,
+    train_image_size=256,
+    num_inference_steps=4,
+    n=4,
+    seed=0,
+):
+    chosen = random.Random(seed).sample(records, k=min(n, len(records)))
+    if not chosen:
+        return
+
+    num_outputs = len(chosen[0]["solutions"])
+    solution_times = chosen[0]["params"]["solution_times"]
+    nrows = 2 * len(chosen)
+    cell_size = 2.35
+    fig, axes = plt.subplots(
+        nrows,
+        num_outputs,
+        figsize=(cell_size * num_outputs, cell_size * nrows),
+        squeeze=False,
+    )
+    fig.subplots_adjust(
+        left=0.16,
+        right=1.0,
+        bottom=0.0,
+        top=0.96,
+        wspace=DEBUG_IMAGE_GUTTER,
+        hspace=0.08,
+    )
+    for column, time_value in enumerate(solution_times):
+        axes[0, column].set_title(f"t={time_value:g}", pad=8)
+
+    for sample_index, record in enumerate(chosen):
+        condition_images, _ = _record_condition_images_and_names(record)
+        generated = infer_joint_solutions(
+            pipe,
+            condition_images[0],
+            prompt_embeds,
+            text_ids,
+            device=device,
+            num_outputs=num_outputs,
+            train_image_size=train_image_size,
+            num_inference_steps=num_inference_steps,
+            seed=seed + sample_index,
+            conditioning_values=record["params"].get("conditioning_values"),
+            condition_images=condition_images,
+        )
+        generated_row = 2 * sample_index
+        solver_row = generated_row + 1
+        for column, (generated_image, solver_image) in enumerate(zip(generated, record["solutions"])):
+            axes[generated_row, column].imshow(as_float_rgb(generated_image))
+            axes[solver_row, column].imshow(as_float_rgb(solver_image))
+            _style_image_axis(axes[generated_row, column])
+            _style_image_axis(axes[solver_row, column])
+
+        params_label = _format_row_label(record)
+        axes[generated_row, 0].set_ylabel(
+            f"{params_label}\n\nFlux" if params_label else "Flux",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=12,
+        )
+        axes[solver_row, 0].set_ylabel(
+            "solver",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=12,
+        )
+
+        if sample_index > 0:
+            separator_y = axes[generated_row, 0].get_position().y1 + 0.01
+            fig.add_artist(
+                Line2D(
+                    [0.02, 1.0],
+                    [separator_y, separator_y],
+                    transform=fig.transFigure,
+                    color="0.85",
+                    linewidth=1.0,
+                )
+            )
+
     display(fig)
     plt.close(fig)
 

@@ -15,6 +15,7 @@ from .elasticity import generate_elasticity_image_pairs
 from .fracture import generate_fracture_image_pairs
 from .heat import generate_heat_image_pairs
 from .ks import generate_ks_image_pairs
+from .navier_stokes import generate_navier_stokes_image_pairs, generate_navier_stokes_multiple_records
 from .ot import generate_ot_image_pairs
 from .poisson import generate_poisson_image_pairs
 from .rendering import rgb_image_to_model_tensor
@@ -48,6 +49,8 @@ def simulation_grid_size(config):
         return config.poisson_grid_size
     if config.pde_kind == "ks":
         return max(config.ks_grid_size, config.output_image_size)
+    if config.pde_kind in {"navier_stokes", "navier_stokes_multiple"}:
+        return config.navier_stokes_grid_size
     if config.pde_kind == "airfoil":
         return config.airfoil_grid_size
     if config.pde_kind == "elliptic":
@@ -226,10 +229,28 @@ def make_pde_records(
                 condition_encoding=config.ks_condition_encoding,
                 sim_device=sim_device,
             )
+        elif config.pde_kind == "navier_stokes":
+            pairs = generate_navier_stokes_image_pairs(
+                seed_chunk,
+                sim_nx=sim_nx,
+                output_size=image_size,
+                final_time=config.navier_stokes_final_time,
+                sim_device=sim_device,
+                progress=progress,
+            )
+        elif config.pde_kind == "navier_stokes_multiple":
+            pairs = generate_navier_stokes_multiple_records(
+                seed_chunk,
+                sim_nx=sim_nx,
+                output_size=image_size,
+                sim_device=sim_device,
+                progress=progress,
+            )
         else:
             raise ValueError(
                 f"Unknown pde_kind={config.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'ks', "
-                "'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
+                "'navier_stokes', 'navier_stokes_multiple', 'airfoil', 'elliptic', 'elasticity', 'eikonal', "
+                "'ot', or 'fracture'."
             )
 
         for pair in pairs:
@@ -336,9 +357,18 @@ def record_to_item(record, image_size=256, index=0):
         if "forcing" in record:
             condition_images.append(record["forcing"])
 
+    solutions = record.get("solutions")
+    if solutions is None:
+        target_pixels = image_to_model_tensor(record["solution"], image_size)
+    else:
+        target_pixels = torch.stack(
+            [image_to_model_tensor(image, image_size) for image in solutions],
+            dim=0,
+        )
+
     item = {
         "condition_pixels": [image_to_model_tensor(image, image_size) for image in condition_images],
-        "target_pixels": image_to_model_tensor(record["solution"], image_size),
+        "target_pixels": target_pixels,
         "index": index,
     }
     if "initial" in record:

@@ -22,7 +22,6 @@ from .airfoil import (
 )
 from .config import TrainingConfig
 from .data import (
-    PdePairDataset,
     StreamingPdePairDataset,
     cpu_sim_worker_count,
     make_pde_records_with_workers,
@@ -80,14 +79,12 @@ from .fracture import (
     FRACTURE_GC_MIN,
     FRACTURE_HIGH_STRAIN_MAX,
     FRACTURE_HIGH_STRAIN_MIN,
-    FRACTURE_INNER_ITERS,
     FRACTURE_LOW_STRAIN_MAX,
     FRACTURE_LOW_STRAIN_MIN,
     FRACTURE_MAX_DEFECTS,
     FRACTURE_MIN_DEFECTS,
     FRACTURE_NU_MAX,
     FRACTURE_NU_MIN,
-    FRACTURE_STEPS,
 )
 from .heat import HEAT_FORCING_NUM_MODES, HEAT_FORCING_SCALE
 from .ks import (
@@ -100,6 +97,21 @@ from .ks import (
     KS_STEPS_PER_FRAME,
     KS_VALUE_BOUNDS,
     ks_effective_discretization,
+)
+from .navier_stokes import (
+    NAVIER_STOKES_CFL,
+    NAVIER_STOKES_DENSITY_MAX,
+    NAVIER_STOKES_DENSITY_MIN,
+    NAVIER_STOKES_DOMAIN_SIZE,
+    NAVIER_STOKES_INITIAL_SPEED_MAX,
+    NAVIER_STOKES_INITIAL_SPEED_MIN,
+    NAVIER_STOKES_MAX_COMPONENTS,
+    NAVIER_STOKES_MIN_COMPONENTS,
+    NAVIER_STOKES_MULTIPLE_TIMES,
+    NAVIER_STOKES_SIGMA_MAX,
+    NAVIER_STOKES_SIGMA_MIN,
+    NAVIER_STOKES_VISCOSITY_MAX,
+    NAVIER_STOKES_VISCOSITY_MIN,
 )
 from .ot import (
     OT_COST_PATH_SAMPLES,
@@ -119,7 +131,12 @@ from .ot import (
 )
 from .poisson import POISSON_NUM_GAUSSIAN_MODES, POISSON_SOURCE_SCALE
 from .thermal_modulation import attach_scalar_parameter_modulation, attach_thermal_coefficient_modulation
-from .visualization import show_ks_timewise_error, show_random_inference_grid, show_smoothed_loss
+from .visualization import (
+    show_ks_timewise_error,
+    show_navier_stokes_multiple_inference_grid,
+    show_random_inference_grid,
+    show_smoothed_loss,
+)
 
 
 def _count_parameters(parameters):
@@ -144,6 +161,20 @@ def _stage(message):
 
 
 def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, config, seed):
+    if config.pde_kind == "navier_stokes_multiple":
+        show_navier_stokes_multiple_inference_grid(
+            pipe,
+            records,
+            prompt_embeds,
+            text_ids,
+            device=device,
+            train_image_size=config.train_image_size,
+            num_inference_steps=config.distilled_num_inference_steps,
+            n=config.navier_stokes_multiple_debug_samples,
+            seed=seed,
+        )
+        return
+
     show_random_inference_grid(
         pipe,
         records,
@@ -241,6 +272,27 @@ def run_training(config=None, vae_lora_checkpoint=None):
             f"init_decay={KS_INITIAL_DECAY:g}, condition={config.ks_condition_encoding}, "
             f"value_bounds={KS_VALUE_BOUNDS}, cmap={KS_CMAP_NAME}"
         )
+    elif config.pde_kind in {"navier_stokes", "navier_stokes_multiple"}:
+        navier_final_time = (
+            NAVIER_STOKES_MULTIPLE_TIMES[-1]
+            if config.pde_kind == "navier_stokes_multiple"
+            else config.navier_stokes_final_time
+        )
+        print(
+            "2D unforced Navier-Stokes: "
+            f"periodic square L={NAVIER_STOKES_DOMAIN_SIZE:g}, grid={config.navier_stokes_grid_size}, "
+            f"T={navier_final_time:g}, CFL={NAVIER_STOKES_CFL:g}, "
+            f"mixture_components={NAVIER_STOKES_MIN_COMPONENTS}..{NAVIER_STOKES_MAX_COMPONENTS}, "
+            f"sigma={NAVIER_STOKES_SIGMA_MIN:g}..{NAVIER_STOKES_SIGMA_MAX:g}, "
+            f"initial_speed={NAVIER_STOKES_INITIAL_SPEED_MIN:g}..{NAVIER_STOKES_INITIAL_SPEED_MAX:g}, "
+            f"density={NAVIER_STOKES_DENSITY_MIN:g}..{NAVIER_STOKES_DENSITY_MAX:g}, "
+            f"kinematic_viscosity={NAVIER_STOKES_VISCOSITY_MIN:g}..{NAVIER_STOKES_VISCOSITY_MAX:g}"
+        )
+        if config.pde_kind == "navier_stokes_multiple":
+            print(
+                "joint target sequence: "
+                f"times={NAVIER_STOKES_MULTIPLE_TIMES}, four noisy latent grids + one shared condition grid"
+            )
     elif config.pde_kind == "airfoil":
         print(
             "Airfoil flow: "
@@ -468,6 +520,26 @@ def run_training(config=None, vae_lora_checkpoint=None):
                 for name, transform in zip(
                     config.fracture_conditioning_names,
                     config.fracture_conditioning_transforms,
+                )
+            )
+        )
+    elif config.pde_kind in {"navier_stokes", "navier_stokes_multiple"}:
+        scalar_modulation = attach_scalar_parameter_modulation(
+            pipe.transformer,
+            bottleneck_dim=config.thermal_modulation_bottleneck_dim,
+            parameter_names=config.navier_stokes_conditioning_names,
+            parameter_transforms=config.navier_stokes_conditioning_transforms,
+            normalization_mean=config.navier_stokes_conditioning_mean,
+            normalization_std=config.navier_stokes_conditioning_std,
+        )
+        scalar_modulation.to(device=device)
+        print(
+            "Navier-Stokes AdaLN conditioning: "
+            + ", ".join(
+                f"{name}:{transform}"
+                for name, transform in zip(
+                    config.navier_stokes_conditioning_names,
+                    config.navier_stokes_conditioning_transforms,
                 )
             )
         )

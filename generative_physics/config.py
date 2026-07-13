@@ -1,11 +1,19 @@
+import math
 from dataclasses import dataclass
 from pathlib import Path
-import math
 
 import torch
 
 from .fracture import FRACTURE_GRID_SIZE, FRACTURE_INNER_ITERS, FRACTURE_STEPS
 from .ks import KS_CONDITION_ENCODING, KS_GRID_SIZE, KS_RENDER_SIZE
+from .navier_stokes import (
+    NAVIER_STOKES_CONDITIONING_MEAN,
+    NAVIER_STOKES_CONDITIONING_NAMES,
+    NAVIER_STOKES_CONDITIONING_STD,
+    NAVIER_STOKES_CONDITIONING_TRANSFORMS,
+    NAVIER_STOKES_FINAL_TIME,
+    NAVIER_STOKES_GRID_SIZE,
+)
 
 
 @dataclass
@@ -27,6 +35,10 @@ class TrainingConfig:
     ks_grid_size: int = KS_GRID_SIZE
     ks_condition_encoding: str = KS_CONDITION_ENCODING
     ks_debug_num_samples: int = 50
+
+    navier_stokes_grid_size: int = NAVIER_STOKES_GRID_SIZE
+    navier_stokes_final_time: float = NAVIER_STOKES_FINAL_TIME
+    navier_stokes_multiple_debug_samples: int = 4
 
     elliptic_grid_size: int = 256
     elliptic_cache_dir: str = "/home/ubuntu/datasets/elliptic"
@@ -76,6 +88,11 @@ class TrainingConfig:
                 self.train_image_size = KS_RENDER_SIZE
             if self.output_image_size == 256:
                 self.output_image_size = KS_RENDER_SIZE
+        if self.pde_kind in {"navier_stokes", "navier_stokes_multiple"}:
+            if self.navier_stokes_grid_size < 16:
+                raise ValueError("navier_stokes_grid_size must be at least 16.")
+        if self.pde_kind == "navier_stokes" and self.navier_stokes_final_time <= 0.0:
+            raise ValueError("navier_stokes_final_time must be positive.")
 
     @property
     def pde_name(self) -> str:
@@ -89,6 +106,10 @@ class TrainingConfig:
             return "Poisson"
         if self.pde_kind == "ks":
             return "Kuramoto-Sivashinsky"
+        if self.pde_kind == "navier_stokes":
+            return "2D Navier-Stokes"
+        if self.pde_kind == "navier_stokes_multiple":
+            return "2D Navier-Stokes (joint four-time output)"
         if self.pde_kind == "airfoil":
             return "Airfoil Potential Flow"
         if self.pde_kind == "elliptic":
@@ -103,7 +124,8 @@ class TrainingConfig:
             return "Phase-Field Fracture"
         raise ValueError(
             f"Unknown pde_kind={self.pde_kind!r}; expected 'heat', 'cgl', 'burgers', 'poisson', 'ks', "
-            "'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', or 'fracture'."
+            "'navier_stokes', 'navier_stokes_multiple', 'airfoil', 'elliptic', 'elasticity', 'eikonal', 'ot', "
+            "or 'fracture'."
         )
 
     @property
@@ -231,9 +253,27 @@ class TrainingConfig:
         return FRACTURE_CONDITIONING_STD
 
     @property
+    def navier_stokes_conditioning_names(self) -> tuple[str, ...]:
+        return NAVIER_STOKES_CONDITIONING_NAMES
+
+    @property
+    def navier_stokes_conditioning_transforms(self) -> tuple[str, ...]:
+        return NAVIER_STOKES_CONDITIONING_TRANSFORMS
+
+    @property
+    def navier_stokes_conditioning_mean(self) -> tuple[float, ...]:
+        return NAVIER_STOKES_CONDITIONING_MEAN
+
+    @property
+    def navier_stokes_conditioning_std(self) -> tuple[float, ...]:
+        return NAVIER_STOKES_CONDITIONING_STD
+
+    @property
     def sim_batch_size(self) -> int:
         if self.pde_kind == "poisson":
             return 32 if torch.cuda.is_available() else 1
+        if self.pde_kind in {"navier_stokes", "navier_stokes_multiple"}:
+            return 8 if torch.cuda.is_available() else 1
         if self.pde_kind in {"airfoil", "elliptic", "elasticity", "eikonal", "ot", "fracture"}:
             return 1
         return 256 if torch.cuda.is_available() else 1
