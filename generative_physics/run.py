@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers import Flux2KleinPipeline
+from huggingface_hub import try_to_load_from_cache
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from torch.utils.data import DataLoader
@@ -71,7 +72,13 @@ from .elliptic import (
     ELLIPTIC_REACTION_MAX,
     ELLIPTIC_REACTION_MIN,
 )
-from .flux_lora import flux2_klein_lora_targets, pde_lora_loss, trainable_parameter_count
+from .flux_lora import (
+    compile_flux2_regions,
+    flux2_klein_lora_targets,
+    pde_lora_loss,
+    trainable_parameter_count,
+    unwrap_flux2_regions,
+)
 from .fracture import (
     FRACTURE_BIAXIAL_STRAIN_MAX,
     FRACTURE_BIAXIAL_STRAIN_MIN,
@@ -130,8 +137,14 @@ from .ot import (
     OT_SINKHORN_ITERS,
 )
 from .poisson import POISSON_NUM_GAUSSIAN_MODES, POISSON_SOURCE_SCALE
-from .thermal_modulation import attach_scalar_parameter_modulation, attach_thermal_coefficient_modulation
+from .thermal_modulation import (
+    attach_condition_latent_adaln_zero,
+    attach_condition_latent_cross_attention,
+    attach_scalar_parameter_modulation,
+    attach_thermal_coefficient_modulation,
+)
 from .visualization import (
+    show_ks_vae_roundtrip_physical_error,
     show_ks_timewise_error,
     show_navier_stokes_multiple_inference_grid,
     show_random_inference_grid,
@@ -160,7 +173,49 @@ def _stage(message):
     print(message, flush=True)
 
 
-def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, config, seed):
+def resolve_pretrained_model_source(model_id):
+    """Prefer an existing model snapshot without requiring Hub authentication."""
+    local_path = Path(model_id).expanduser()
+    if local_path.exists():
+        return local_path.resolve()
+
+    cached_model_index = try_to_load_from_cache(model_id, "model_index.json")
+    if isinstance(cached_model_index, str):
+        return Path(cached_model_index).parent.resolve()
+    return model_id
+
+
+def resolve_vae_lora_checkpoint(config, vae_lora_checkpoint=None):
+    if vae_lora_checkpoint is not None:
+        return Path(vae_lora_checkpoint).expanduser().resolve()
+    if config.pde_kind != "ks":
+        return None
+
+    checkpoint_dir = Path(config.ks_vae_lora_dir).expanduser()
+    candidates = [
+        checkpoint
+        for checkpoint in checkpoint_dir.glob("*.safetensors")
+        if checkpoint.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda checkpoint: (checkpoint.stat().st_mtime_ns, checkpoint.name),
+    ).resolve()
+
+
+def _show_validation_debug(
+    pipe,
+    records,
+    prompt_embeds,
+    text_ids,
+    device,
+    config,
+    seed,
+    negative_prompt_embeds=None,
+    negative_text_ids=None,
+):
     if config.pde_kind == "navier_stokes_multiple":
         show_navier_stokes_multiple_inference_grid(
             pipe,
@@ -169,7 +224,7 @@ def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, confi
             text_ids,
             device=device,
             train_image_size=config.train_image_size,
-            num_inference_steps=config.distilled_num_inference_steps,
+            num_inference_steps=config.inference_num_steps,
             n=config.navier_stokes_multiple_debug_samples,
             seed=seed,
         )
@@ -183,7 +238,10 @@ def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, confi
         device=device,
         pde_name=config.pde_name,
         train_image_size=config.train_image_size,
-        num_inference_steps=config.distilled_num_inference_steps,
+        num_inference_steps=config.inference_num_steps,
+        guidance_scale=config.inference_guidance_scale,
+        negative_prompt_embeds=negative_prompt_embeds,
+        negative_text_ids=negative_text_ids,
         n=config.validation_num_images,
         seed=seed,
     )
@@ -195,7 +253,10 @@ def _show_validation_debug(pipe, records, prompt_embeds, text_ids, device, confi
             text_ids,
             device=device,
             train_image_size=config.train_image_size,
-            num_inference_steps=config.distilled_num_inference_steps,
+            num_inference_steps=config.inference_num_steps,
+            guidance_scale=config.inference_guidance_scale,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
             n=config.ks_debug_num_samples,
             seed=seed,
         )
@@ -207,21 +268,43 @@ def print_parameter_report(pipe):
     scalar_modulation_trainable = _count_parameters(
         p for name, p in transformer_params if p.requires_grad and name.startswith("thermal_modulation.")
     )
+    condition_modulation_trainable = _count_parameters(
+        p
+        for name, p in transformer_params
+        if p.requires_grad and name.startswith("condition_latent_adaln_zero.")
+    )
+    condition_cross_attention_trainable = _count_parameters(
+        p
+        for name, p in transformer_params
+        if p.requires_grad and name.startswith("condition_latent_cross_attention.")
+    )
     other_transformer_trainable = _count_parameters(
         p
         for name, p in transformer_params
-        if p.requires_grad and "lora_" not in name and not name.startswith("thermal_modulation.")
+        if p.requires_grad
+        and "lora_" not in name
+        and not name.startswith("thermal_modulation.")
+        and not name.startswith("condition_latent_adaln_zero.")
+        and not name.startswith("condition_latent_cross_attention.")
     )
     frozen_transformer = _count_parameters(p for _, p in transformer_params if not p.requires_grad)
     frozen_vae = _count_parameters(p for p in pipe.vae.parameters() if not p.requires_grad)
     frozen_text_encoder = _count_parameters(p for p in pipe.text_encoder.parameters() if not p.requires_grad)
 
-    trainable_total = lora_trainable + scalar_modulation_trainable + other_transformer_trainable
+    trainable_total = (
+        lora_trainable
+        + scalar_modulation_trainable
+        + condition_modulation_trainable
+        + condition_cross_attention_trainable
+        + other_transformer_trainable
+    )
     frozen_total = frozen_transformer + frozen_vae + frozen_text_encoder
     print("parameter report:")
     print(f"  trainable: {trainable_total:,}")
     print(f"    LoRA adapters: {lora_trainable:,}")
     print(f"    scalar AdaLN modulators: {scalar_modulation_trainable:,}")
+    print(f"    condition-latent AdaLN-Zero adapters: {condition_modulation_trainable:,}")
+    print(f"    condition-latent cross-attention adapters: {condition_cross_attention_trainable:,}")
     print(f"    other transformer trainable: {other_transformer_trainable:,}")
     print(f"  frozen: {frozen_total:,}")
     print(f"    transformer base: {frozen_transformer:,}")
@@ -239,6 +322,14 @@ def run_training(config=None, vae_lora_checkpoint=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"device={device}, dtype={weight_dtype}")
+    print(f"model={config.model_id}")
+    print(
+        f"inference: steps={config.inference_num_steps}, "
+        f"guidance_scale={config.inference_guidance_scale:g}; "
+        f"training_sigmas={config.training_sigma_mode}"
+    )
+    if config.inference_guidance_scale > 1.0 and not config.prompt:
+        print("inference CFG is neutral because both prompts are empty; using one model pass per step")
     data_grid_size = simulation_grid_size(config)
     cpu_generated_samples = simulations_run_on_cpu(config, device)
     sample_sim_device = torch.device("cpu") if cpu_generated_samples else device
@@ -419,10 +510,18 @@ def run_training(config=None, vae_lora_checkpoint=None):
         **train_loader_kwargs,
     )
 
-    _stage("loading Flux pipeline")
-    pipe = Flux2KleinPipeline.from_pretrained(config.model_id, torch_dtype=weight_dtype)
+    model_source = resolve_pretrained_model_source(config.model_id)
+    if str(model_source) != config.model_id:
+        _stage(f"loading Flux pipeline from local snapshot {model_source}")
+    else:
+        _stage("loading Flux pipeline")
+    pipe = Flux2KleinPipeline.from_pretrained(
+        model_source,
+        torch_dtype=weight_dtype,
+        token=False,
+    )
+    vae_lora_checkpoint = resolve_vae_lora_checkpoint(config, vae_lora_checkpoint)
     if vae_lora_checkpoint is not None:
-        vae_lora_checkpoint = Path(vae_lora_checkpoint).expanduser().resolve()
         if not vae_lora_checkpoint.is_file():
             raise FileNotFoundError(f"VAE LoRA checkpoint not found: {vae_lora_checkpoint}")
         _stage(f"loading VAE LoRA from {vae_lora_checkpoint}")
@@ -432,6 +531,11 @@ def run_training(config=None, vae_lora_checkpoint=None):
             prefix=None,
             adapter_name="vae_finetune",
             low_cpu_mem_usage=True,
+        )
+    elif config.pde_kind == "ks":
+        _stage(
+            "no KS VAE LoRA checkpoint found in "
+            f"{Path(config.ks_vae_lora_dir).expanduser().resolve()}; using the base VAE"
         )
     _stage("pipeline loaded; moving pipeline to training device")
     pipe.to(device)
@@ -449,13 +553,39 @@ def run_training(config=None, vae_lora_checkpoint=None):
             max_sequence_length=config.max_sequence_length,
             text_encoder_out_layers=config.text_encoder_out_layers,
         )
+        if config.inference_guidance_scale > 1.0:
+            negative_prompt_embeds, negative_text_ids = pipe.encode_prompt(
+                "",
+                device=device,
+                max_sequence_length=config.max_sequence_length,
+                text_encoder_out_layers=config.text_encoder_out_layers,
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_text_ids = None
     prompt_embeds = prompt_embeds.detach().to(device=device, dtype=weight_dtype)
     text_ids = text_ids.detach().to(device=device)
+    if negative_prompt_embeds is not None:
+        negative_prompt_embeds = negative_prompt_embeds.detach().to(
+            device=device,
+            dtype=weight_dtype,
+        )
+        negative_text_ids = negative_text_ids.detach().to(device=device)
 
     _stage("prompt encoded; moving text encoder to CPU")
     pipe.text_encoder.to("cpu")
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+    if config.pde_kind == "ks" and config.ks_debug_num_samples > 0:
+        _stage("evaluating base and fine-tuned VAE round-trip physical error")
+        show_ks_vae_roundtrip_physical_error(
+            pipe,
+            eval_records,
+            device=device,
+            n=config.ks_debug_num_samples,
+            seed=config.seed,
+        )
 
     _stage("attaching LoRA adapters")
     lora_config = LoraConfig(
@@ -546,9 +676,32 @@ def run_training(config=None, vae_lora_checkpoint=None):
     else:
         print("scalar parameter conditioning: disabled")
 
-    if hasattr(pipe.transformer, "enable_gradient_checkpointing"):
+    if config.pde_kind == "ks":
+        if config.ks_condition_adapter_mode == "adaln_zero":
+            condition_modulation = attach_condition_latent_adaln_zero(pipe.transformer)
+            condition_modulation.to(device=device)
+            print(
+                "KS condition adapter: unpooled per-token Linear AdaLN-Zero "
+                "on target image tokens"
+            )
+        elif config.ks_condition_adapter_mode == "cross_attention":
+            condition_cross_attention = attach_condition_latent_cross_attention(pipe.transformer)
+            condition_cross_attention.to(device=device)
+            print(
+                "KS condition adapter: unpooled block-end 512d/8-head cross-attention "
+                "residual on all image tokens"
+            )
+        else:
+            print("KS condition adapter: disabled")
+
+    if config.transformer_gradient_checkpointing and hasattr(
+        pipe.transformer,
+        "enable_gradient_checkpointing",
+    ):
         _stage("enabling gradient checkpointing")
         pipe.transformer.enable_gradient_checkpointing()
+    else:
+        _stage("transformer gradient checkpointing disabled")
 
     trainable, total = trainable_parameter_count(pipe.transformer)
     print(f"trainable transformer params: {trainable:,} / {total:,} ({100 * trainable / total:.4f}%)")
@@ -572,6 +725,23 @@ def run_training(config=None, vae_lora_checkpoint=None):
             device,
             config,
             config.seed,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+        )
+
+    if config.transformer_compile_regions:
+        compile_stats = compile_flux2_regions(
+            pipe.transformer,
+            mode=config.transformer_compile_mode,
+        )
+        _stage(
+            "regional compilation configured: "
+            f"{compile_stats['dit_blocks']} DiT blocks, "
+            f"{compile_stats['adaln_zero']} shared AdaLN-Zero modules, "
+            f"{compile_stats['scalar_adaln_zero']} scalar AdaLN-Zero modules, "
+            f"{compile_stats['condition_adaln_zero']} condition-latent AdaLN-Zero modules, "
+            f"{compile_stats['condition_cross_attention']} condition cross-attention modules; "
+            f"mode={config.transformer_compile_mode}; first training use will compile"
         )
 
     pipe.transformer.train()
@@ -579,7 +749,7 @@ def run_training(config=None, vae_lora_checkpoint=None):
     printed_schedule = False
     loss_history = []
     ema_loss = None
-    ema_loss_decay = 0.95
+    ema_loss_decay = 0.99
 
     print("starting LoRA training; tqdm shows loss and ema")
     progress = tqdm(
@@ -606,7 +776,8 @@ def run_training(config=None, vae_lora_checkpoint=None):
                 prompt_embeds=prompt_embeds,
                 text_ids=text_ids,
                 device=device,
-                num_inference_steps=config.distilled_num_inference_steps,
+                num_inference_steps=config.inference_num_steps,
+                training_sigma_mode=config.training_sigma_mode,
                 print_schedule=not printed_schedule,
             )
             printed_schedule = True
@@ -637,11 +808,15 @@ def run_training(config=None, vae_lora_checkpoint=None):
                 device,
                 config,
                 config.seed + global_step,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_text_ids=negative_text_ids,
             )
             show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     pipe.transformer.eval()
+    if config.transformer_compile_regions:
+        unwrap_flux2_regions(pipe.transformer)
     transformer_lora_layers = get_peft_model_state_dict(pipe.transformer)
     Flux2KleinPipeline.save_lora_weights(
         save_directory=config.output_dir,
@@ -657,6 +832,16 @@ def run_training(config=None, vae_lora_checkpoint=None):
             },
             config.output_dir / "scalar_modulation.pt",
         )
+    if hasattr(pipe.transformer, "condition_latent_adaln_zero"):
+        torch.save(
+            pipe.transformer.condition_latent_adaln_zero.state_dict(),
+            config.output_dir / "condition_latent_adaln_zero.pt",
+        )
+    if hasattr(pipe.transformer, "condition_latent_cross_attention"):
+        torch.save(
+            pipe.transformer.condition_latent_cross_attention.state_dict(),
+            config.output_dir / "condition_latent_cross_attention.pt",
+        )
     print(f"saved LoRA to {config.output_dir.resolve()}")
 
     _show_validation_debug(
@@ -667,6 +852,8 @@ def run_training(config=None, vae_lora_checkpoint=None):
         device,
         config,
         config.seed,
+        negative_prompt_embeds=negative_prompt_embeds,
+        negative_text_ids=negative_text_ids,
     )
     show_smoothed_loss(loss_history, alpha=config.loss_ema_alpha)
 
@@ -682,5 +869,7 @@ def run_training(config=None, vae_lora_checkpoint=None):
         "loss_history": loss_history,
         "prompt_embeds": prompt_embeds,
         "text_ids": text_ids,
+        "negative_prompt_embeds": negative_prompt_embeds,
+        "negative_text_ids": negative_text_ids,
         "device": device,
     }

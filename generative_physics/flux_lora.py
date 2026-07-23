@@ -3,6 +3,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
+from accelerate.utils import compile_regions
 from diffusers import Flux2KleinPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu, retrieve_timesteps
 
@@ -17,10 +18,10 @@ def flux2_klein_lora_targets(transformer):
         "to_v",
         "to_out.0",
         "to_qkv_mlp_proj",
-        "ff.linear_in",
-        "ff.linear_out",
-        "x_embedder",
-        "proj_out",
+        # "ff.linear_in",
+        # "ff.linear_out",
+        # "x_embedder",
+        # "proj_out",
     ] + [
         f"single_transformer_blocks.{i}.attn.to_out" for i in range(min(24, n_single))
     ]
@@ -30,6 +31,120 @@ def trainable_parameter_count(module):
     trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
     total = sum(p.numel() for p in module.parameters())
     return trainable, total
+
+
+def _uses_condition_latent_adapter(transformer):
+    return hasattr(transformer, "condition_latent_adaln_zero") or hasattr(
+        transformer,
+        "condition_latent_cross_attention",
+    )
+
+
+_DIT_REGION_NAMES = ("transformer_blocks", "single_transformer_blocks")
+_ADALN_ZERO_REGION_NAMES = (
+    "double_stream_modulation_img",
+    "double_stream_modulation_txt",
+    "single_stream_modulation",
+)
+
+
+def compile_flux2_regions(transformer, **compile_kwargs):
+    stats = {
+        "dit_blocks": 0,
+        "adaln_zero": 0,
+        "scalar_adaln_zero": 0,
+        "condition_adaln_zero": 0,
+        "condition_cross_attention": 0,
+    }
+    for name in _DIT_REGION_NAMES:
+        blocks = getattr(transformer, name)
+        stats["dit_blocks"] += len(blocks)
+        setattr(transformer, name, compile_regions(blocks, **compile_kwargs))
+
+    for name in _ADALN_ZERO_REGION_NAMES:
+        setattr(
+            transformer,
+            name,
+            compile_regions(getattr(transformer, name), **compile_kwargs),
+        )
+        stats["adaln_zero"] += 1
+
+    scalar_modulation = getattr(transformer, "thermal_modulation", None)
+    if scalar_modulation is not None:
+        for name in ("double_blocks", "single_blocks"):
+            blocks = getattr(scalar_modulation, name)
+            stats["scalar_adaln_zero"] += len(blocks)
+            setattr(
+                scalar_modulation,
+                name,
+                compile_regions(blocks, **compile_kwargs),
+            )
+
+    condition_modulation = getattr(transformer, "condition_latent_adaln_zero", None)
+    if condition_modulation is not None:
+        for name in ("double_blocks", "single_blocks"):
+            blocks = getattr(condition_modulation, name)
+            stats["condition_adaln_zero"] += len(blocks)
+            setattr(
+                condition_modulation,
+                name,
+                compile_regions(blocks, **compile_kwargs),
+            )
+
+    condition_cross_attention = getattr(transformer, "condition_latent_cross_attention", None)
+    if condition_cross_attention is not None:
+        for name in ("double_blocks", "single_blocks"):
+            blocks = getattr(condition_cross_attention, name)
+            stats["condition_cross_attention"] += len(blocks)
+            setattr(
+                condition_cross_attention,
+                name,
+                compile_regions(blocks, **compile_kwargs),
+            )
+    return stats
+
+
+def _unwrap_compiled_module(module):
+    while module.__dict__.get("_orig_mod") is not None:
+        module = module.__dict__["_orig_mod"]
+    return module
+
+
+def unwrap_flux2_regions(transformer):
+    for name in _DIT_REGION_NAMES + _ADALN_ZERO_REGION_NAMES:
+        setattr(
+            transformer,
+            name,
+            _unwrap_compiled_module(getattr(transformer, name)),
+        )
+
+    scalar_modulation = getattr(transformer, "thermal_modulation", None)
+    if scalar_modulation is not None:
+        for name in ("double_blocks", "single_blocks"):
+            setattr(
+                scalar_modulation,
+                name,
+                _unwrap_compiled_module(getattr(scalar_modulation, name)),
+            )
+
+    condition_modulation = getattr(transformer, "condition_latent_adaln_zero", None)
+    if condition_modulation is not None:
+        for name in ("double_blocks", "single_blocks"):
+            setattr(
+                condition_modulation,
+                name,
+                _unwrap_compiled_module(getattr(condition_modulation, name)),
+            )
+
+    condition_cross_attention = getattr(transformer, "condition_latent_cross_attention", None)
+    if condition_cross_attention is not None:
+        for name in ("double_blocks", "single_blocks"):
+            setattr(
+                condition_cross_attention,
+                name,
+                _unwrap_compiled_module(getattr(condition_cross_attention, name)),
+            )
+    return transformer
 
 
 def encode_flux2_latents(pipe, pixels, device):
@@ -57,10 +172,17 @@ def _prepare_joint_target_ids(latent_frames):
 
 
 _distilled_schedule_cache = {}
+_base_training_schedule_cache = {}
 
 
 def distilled_timesteps_and_sigmas(scheduler, image_seq_len, device, dtype, num_inference_steps=4):
-    key = (int(image_seq_len), str(device), str(dtype), int(num_inference_steps))
+    key = (
+        id(scheduler),
+        int(image_seq_len),
+        str(device),
+        str(dtype),
+        int(num_inference_steps),
+    )
     if key in _distilled_schedule_cache:
         return _distilled_schedule_cache[key]
 
@@ -105,7 +227,86 @@ def sample_exact_distilled_training_step(
     return timesteps, sigmas, timesteps_4, sigmas_4
 
 
-def pde_lora_loss(pipe, batch, prompt_embeds, text_ids, device, num_inference_steps=4, print_schedule=False):
+def inference_aligned_training_timesteps_and_sigmas(
+    scheduler,
+    image_seq_len,
+    device,
+    dtype,
+    inference_num_steps,
+):
+    num_train_timesteps = int(scheduler.config.num_train_timesteps)
+    key = (
+        id(scheduler),
+        int(image_seq_len),
+        str(device),
+        str(dtype),
+        int(inference_num_steps),
+        num_train_timesteps,
+    )
+    if key not in _base_training_schedule_cache:
+        training_scheduler = copy.deepcopy(scheduler)
+        sigmas = np.linspace(
+            1.0,
+            1.0 / num_train_timesteps,
+            num_train_timesteps,
+        )
+        mu = compute_empirical_mu(
+            image_seq_len=image_seq_len,
+            num_steps=inference_num_steps,
+        )
+        timesteps, _ = retrieve_timesteps(
+            training_scheduler,
+            num_train_timesteps,
+            device=device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        _base_training_schedule_cache[key] = (
+            timesteps.to(device=device),
+            training_scheduler.sigmas[: len(timesteps)].to(
+                device=device,
+                dtype=dtype,
+            ),
+            mu,
+        )
+    return _base_training_schedule_cache[key]
+
+
+def sample_inference_aligned_training_step(
+    scheduler,
+    image_seq_len,
+    batch_size,
+    latent_dtype,
+    device,
+    inference_num_steps,
+):
+    schedule_timesteps, schedule_sigmas, mu = inference_aligned_training_timesteps_and_sigmas(
+        scheduler,
+        image_seq_len=image_seq_len,
+        device=device,
+        dtype=latent_dtype,
+        inference_num_steps=inference_num_steps,
+    )
+    step_indices = torch.randint(0, len(schedule_timesteps), (batch_size,), device=device)
+    return (
+        schedule_timesteps[step_indices],
+        schedule_sigmas[step_indices],
+        schedule_timesteps,
+        schedule_sigmas,
+        mu,
+    )
+
+
+def pde_lora_loss(
+    pipe,
+    batch,
+    prompt_embeds,
+    text_ids,
+    device,
+    num_inference_steps=4,
+    training_sigma_mode="distilled",
+    print_schedule=False,
+):
     condition_pixel_batches = batch.get("condition_pixels")
     if condition_pixel_batches is None:
         condition_pixel_batches = [batch["initial_pixels"]]
@@ -153,17 +354,45 @@ def pde_lora_loss(pipe, batch, prompt_embeds, text_ids, device, num_inference_st
         .repeat(batch_size, 1, 1)
     )
     noise_frames = [torch.randn_like(latents) for latents in target_latent_frames]
-    timesteps, sigmas, timesteps_4, sigmas_4 = sample_exact_distilled_training_step(
-        pipe.scheduler,
-        image_seq_len=target_ids.shape[1],
-        batch_size=batch_size,
-        latent_dtype=target_latent_frames[0].dtype,
-        device=device,
-        num_inference_steps=num_inference_steps,
-    )
-    if print_schedule:
-        print("exact 4-step timesteps:", [float(x) for x in timesteps_4.detach().cpu()])
-        print("exact 4-step sigmas:", [float(x) for x in sigmas_4.detach().cpu()])
+    schedule_mu = None
+    if training_sigma_mode == "inference_aligned":
+        (
+            timesteps,
+            sigmas,
+            schedule_timesteps,
+            schedule_sigmas,
+            schedule_mu,
+        ) = sample_inference_aligned_training_step(
+            pipe.scheduler,
+            image_seq_len=target_ids.shape[1],
+            batch_size=batch_size,
+            latent_dtype=target_latent_frames[0].dtype,
+            device=device,
+            inference_num_steps=num_inference_steps,
+        )
+    elif training_sigma_mode == "distilled":
+        timesteps, sigmas, schedule_timesteps, schedule_sigmas = sample_exact_distilled_training_step(
+            pipe.scheduler,
+            image_seq_len=target_ids.shape[1],
+            batch_size=batch_size,
+            latent_dtype=target_latent_frames[0].dtype,
+            device=device,
+            num_inference_steps=num_inference_steps,
+        )
+    else:
+        raise ValueError(
+            "training_sigma_mode must be 'distilled' or 'inference_aligned'."
+        )
+    if print_schedule and training_sigma_mode == "inference_aligned":
+        print(
+            "base training sigmas: inference-aligned over "
+            f"{len(schedule_sigmas)} levels using the {num_inference_steps}-step "
+            f"shift (mu={schedule_mu:g}) "
+            f"[{float(schedule_sigmas.min()):g}, {float(schedule_sigmas.max()):g}]"
+        )
+    elif print_schedule:
+        print("distilled training timesteps:", [float(x) for x in schedule_timesteps.detach().cpu()])
+        print("distilled training sigmas:", [float(x) for x in schedule_sigmas.detach().cpu()])
 
     latent_sigmas = sigmas.reshape(batch_size, 1, 1, 1)
     noisy_target_frames = [
@@ -199,6 +428,11 @@ def pde_lora_loss(pipe, batch, prompt_embeds, text_ids, device, num_inference_st
         transformer_kwargs["conditioning_values"] = conditioning_values
     elif thermal_diffusivity is not None:
         transformer_kwargs["thermal_diffusivity"] = thermal_diffusivity
+    if _uses_condition_latent_adapter(pipe.transformer):
+        if len(packed_conditions) != 1:
+            raise ValueError("condition-latent AdaLN-Zero requires exactly one condition image.")
+        transformer_kwargs["condition_latents"] = packed_conditions[0].to(pipe.transformer.dtype)
+        transformer_kwargs["target_token_count"] = packed_noisy_target.shape[1]
     model_pred = pipe.transformer(
         hidden_states=hidden_states,
         timestep=timesteps / 1000,
@@ -222,6 +456,9 @@ def infer_solution(
     device,
     train_image_size=256,
     num_inference_steps=4,
+    guidance_scale=1.0,
+    negative_prompt_embeds=None,
+    negative_text_ids=None,
     seed=0,
     thermal_diffusivity=None,
     conditioning_values=None,
@@ -254,6 +491,21 @@ def infer_solution(
 
     prompt_embeds = prompt_embeds.to(device=device, dtype=pipe.transformer.dtype)
     text_ids = text_ids.to(device=device)
+    requested_classifier_free_guidance = float(guidance_scale) > 1.0
+    if requested_classifier_free_guidance:
+        if negative_prompt_embeds is None or negative_text_ids is None:
+            raise ValueError(
+                "negative prompt embeddings and text IDs are required when guidance_scale > 1."
+            )
+        negative_prompt_embeds = negative_prompt_embeds.to(
+            device=device,
+            dtype=pipe.transformer.dtype,
+        )
+        negative_text_ids = negative_text_ids.to(device=device)
+    do_classifier_free_guidance = requested_classifier_free_guidance and not (
+        torch.equal(prompt_embeds, negative_prompt_embeds)
+        and torch.equal(text_ids, negative_text_ids)
+    )
     num_channels_latents = pipe.transformer.config.in_channels // 4
     latents, latent_ids = pipe.prepare_latents(
         batch_size=1,
@@ -299,6 +551,9 @@ def infer_solution(
                 transformer_kwargs["thermal_diffusivity"] = torch.as_tensor(
                     [thermal_diffusivity], device=device, dtype=torch.float32
                 )
+            if _uses_condition_latent_adapter(pipe.transformer):
+                transformer_kwargs["condition_latents"] = image_latents.to(pipe.transformer.dtype)
+                transformer_kwargs["target_token_count"] = latents.shape[1]
             noise_pred = pipe.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep / 1000,
@@ -310,6 +565,22 @@ def infer_solution(
                 **transformer_kwargs,
             )[0]
         noise_pred = noise_pred[:, : latents.shape[1]]
+        if do_classifier_free_guidance:
+            with pipe.transformer.cache_context("uncond"):
+                negative_noise_pred = pipe.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    guidance=None,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    txt_ids=negative_text_ids,
+                    img_ids=latent_model_ids,
+                    return_dict=False,
+                    **transformer_kwargs,
+                )[0]
+            negative_noise_pred = negative_noise_pred[:, : latents.shape[1]]
+            noise_pred = negative_noise_pred + float(guidance_scale) * (
+                noise_pred - negative_noise_pred
+            )
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     latents = Flux2KleinPipeline._unpack_latents_with_ids(latents, latent_ids)

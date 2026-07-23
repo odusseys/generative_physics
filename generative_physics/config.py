@@ -16,9 +16,13 @@ from .navier_stokes import (
 )
 
 
+FLUX2_KLEIN_DISTILLED_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+FLUX2_KLEIN_BASE_MODEL_ID = "black-forest-labs/FLUX.2-klein-base-4B"
+
+
 @dataclass
 class TrainingConfig:
-    model_id: str = "black-forest-labs/FLUX.2-klein-4B"
+    model_id: str | None = None
     pde_kind: str = "heat"
 
     train_image_size: int = 256
@@ -35,6 +39,8 @@ class TrainingConfig:
     ks_grid_size: int = KS_GRID_SIZE
     ks_condition_encoding: str = KS_CONDITION_ENCODING
     ks_debug_num_samples: int = 50
+    ks_vae_lora_dir: str = "ks_vae_lora"
+    ks_condition_adapter_mode: str = "adaln_zero"
 
     navier_stokes_grid_size: int = NAVIER_STOKES_GRID_SIZE
     navier_stokes_final_time: float = NAVIER_STOKES_FINAL_TIME
@@ -69,17 +75,36 @@ class TrainingConfig:
     loss_ema_alpha: float = 0.03
 
     learning_rate: float = 3e-5
-    lora_rank: int = 32
+    lora_rank: int = 16
     lora_dropout: float = 0.0
     thermal_modulation_bottleneck_dim: int = 64
+    transformer_gradient_checkpointing: bool = False
+    transformer_compile_regions: bool = True
+    transformer_compile_mode: str = "default"
 
     distilled_num_inference_steps: int = 4
+    base_num_inference_steps: int = 20
+    base_guidance_scale: float = 4.0
     max_sequence_length: int = 512
     text_encoder_out_layers: tuple[int, int, int] = (9, 18, 27)
     seed: int = 1234
 
     def __post_init__(self):
+        if self.model_id is None:
+            self.model_id = (
+                FLUX2_KLEIN_BASE_MODEL_ID
+                if self.pde_kind == "ks"
+                else FLUX2_KLEIN_DISTILLED_MODEL_ID
+            )
+        if self.distilled_num_inference_steps < 1 or self.base_num_inference_steps < 1:
+            raise ValueError("inference step counts must be positive.")
+        if self.base_guidance_scale < 1.0:
+            raise ValueError("base_guidance_scale must be at least 1.")
         if self.pde_kind == "ks":
+            if self.ks_condition_adapter_mode not in {"adaln_zero", "cross_attention", "none"}:
+                raise ValueError(
+                    "ks_condition_adapter_mode must be 'adaln_zero', 'cross_attention', or 'none'."
+                )
             if self.ks_condition_encoding not in {"hilbert", "y_constant"}:
                 raise ValueError(
                     "ks_condition_encoding must be 'hilbert' or 'y_constant'."
@@ -130,7 +155,27 @@ class TrainingConfig:
 
     @property
     def output_dir(self) -> Path:
+        if self.pde_kind == "ks" and self.model_id == FLUX2_KLEIN_BASE_MODEL_ID:
+            return Path("ks_flux2_klein_base_4b_lora")
         return Path(f"{self.pde_kind}_flux2_klein_4b_lora")
+
+    @property
+    def inference_num_steps(self) -> int:
+        if self.pde_kind == "ks" and self.model_id == FLUX2_KLEIN_BASE_MODEL_ID:
+            return self.base_num_inference_steps
+        return self.distilled_num_inference_steps
+
+    @property
+    def inference_guidance_scale(self) -> float:
+        if self.pde_kind == "ks" and self.model_id == FLUX2_KLEIN_BASE_MODEL_ID:
+            return self.base_guidance_scale
+        return 1.0
+
+    @property
+    def training_sigma_mode(self) -> str:
+        if self.pde_kind == "ks" and self.model_id == FLUX2_KLEIN_BASE_MODEL_ID:
+            return "inference_aligned"
+        return "distilled"
 
     @property
     def prompt(self) -> str:

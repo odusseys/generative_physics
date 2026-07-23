@@ -2,13 +2,28 @@ import random
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from IPython.display import display
 from matplotlib.lines import Line2D
 from tqdm.auto import tqdm
 
 from .flux_lora import infer_joint_solutions, infer_solution
-from .ks import KS_CMAP_NAME, KS_DT, KS_STEPS_PER_FRAME, flame_image_to_normalized_array
-from .rendering import as_float_rgb, image_size_xy, resize_float_rgb
+from .ks import (
+    KS_CMAP_NAME,
+    KS_DOMAIN_LENGTH,
+    KS_DT,
+    KS_RANDOM_SAMPLING_MAE,
+    KS_STEPS_PER_FRAME,
+    KS_VALUE_BOUNDS,
+    flame_image_to_normalized_array,
+    ks_integrate_cnab2_batch,
+)
+from .rendering import (
+    as_float_rgb,
+    image_size_xy,
+    resize_float_rgb,
+    rgb_image_to_model_tensor,
+)
 
 
 VARIABLE_LABELS = {
@@ -184,6 +199,9 @@ def show_random_inference_grid(
     pde_name,
     train_image_size=256,
     num_inference_steps=4,
+    guidance_scale=1.0,
+    negative_prompt_embeds=None,
+    negative_text_ids=None,
     n=8,
     seed=None,
 ):
@@ -249,6 +267,9 @@ def show_random_inference_grid(
             device=device,
             train_image_size=train_image_size,
             num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
             seed=(seed or 0) + row,
             thermal_diffusivity=thermal_diffusivity,
             conditioning_values=conditioning_values,
@@ -388,6 +409,9 @@ def show_ks_timewise_error(
     device,
     train_image_size=256,
     num_inference_steps=4,
+    guidance_scale=1.0,
+    negative_prompt_embeds=None,
+    negative_text_ids=None,
     n=50,
     seed=0,
 ):
@@ -406,6 +430,9 @@ def show_ks_timewise_error(
             device=device,
             train_image_size=train_image_size,
             num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
             seed=seed + sample_index,
             condition_images=condition_images,
         )
@@ -416,20 +443,171 @@ def show_ks_timewise_error(
         target_values = flame_image_to_normalized_array(ground_truth, cmap_name=KS_CMAP_NAME)
         errors.append(np.abs(generated_values - target_values).mean(axis=1))
 
-    mean_error = np.stack(errors).mean(axis=0)
+    mean_error = np.minimum(
+        np.stack(errors).mean(axis=0),
+        KS_RANDOM_SAMPLING_MAE,
+    )
     dt = float(chosen[0]["params"].get("dt", KS_DT))
     steps_per_frame = int(chosen[0]["params"].get("steps_per_frame", KS_STEPS_PER_FRAME))
     times = np.arange(mean_error.size) * dt * steps_per_frame
     fig, ax = plt.subplots(figsize=(8, 3.2))
-    ax.plot(times, mean_error, color="tab:red", linewidth=2.0)
+    ax.plot(times, mean_error, color="tab:orange", linewidth=2.0, label="model error")
+    ax.axhline(
+        KS_RANDOM_SAMPLING_MAE,
+        color="tab:red",
+        linewidth=2.0,
+        label="random sampling error",
+    )
     ax.set_title(f"KS decoded absolute error over {len(chosen)} samples")
     ax.set_xlabel("time")
     ax.set_ylabel("mean absolute error")
     ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
     plt.tight_layout()
     display(fig)
     plt.close(fig)
     return mean_error
+
+
+def show_ks_vae_roundtrip_physical_error(
+    pipe,
+    records,
+    device,
+    n=50,
+    seed=0,
+    vae_batch_size=4,
+    error_cap=KS_RANDOM_SAMPLING_MAE,
+):
+    """Compare KS forecasts from base- and fine-tuned-VAE initial conditions."""
+    chosen = random.Random(seed).sample(records, k=min(int(n), len(records)))
+    if not chosen:
+        return {
+            "times": np.array([], dtype=np.float32),
+            "base_error": np.array([], dtype=np.float32),
+            "finetuned_error": np.array([], dtype=np.float32),
+        }
+
+    params = chosen[0]["params"]
+    dt = float(params.get("dt", KS_DT))
+    steps_per_frame = int(params.get("steps_per_frame", KS_STEPS_PER_FRAME))
+    time_frames = int(params.get("time_frames", image_size_xy(chosen[0]["solution"])[1]))
+    value_bounds = tuple(params.get("value_bounds", KS_VALUE_BOUNDS))
+    value_min, value_max = map(float, value_bounds)
+    value_range = value_max - value_min
+    if value_range <= 0.0:
+        raise ValueError("KS value bounds must have positive width.")
+
+    for record in chosen[1:]:
+        record_params = record["params"]
+        discretization = (
+            float(record_params.get("dt", KS_DT)),
+            int(record_params.get("steps_per_frame", KS_STEPS_PER_FRAME)),
+            int(record_params.get("time_frames", image_size_xy(record["solution"])[1])),
+        )
+        if discretization != (dt, steps_per_frame, time_frames):
+            raise ValueError("All KS VAE diagnostic records must share one discretization.")
+
+    initial_pixels = torch.stack(
+        [rgb_image_to_model_tensor(record["initial"]) for record in chosen]
+    )
+    reference = torch.from_numpy(
+        np.stack(
+            [
+                flame_image_to_normalized_array(record["solution"], cmap_name=KS_CMAP_NAME)
+                for record in chosen
+            ]
+        )
+    ).to(device=device, dtype=torch.float64)
+
+    vae = pipe.vae
+    vae_was_training = vae.training
+    vae.eval()
+    vae_dtype = next(vae.parameters()).dtype
+    has_finetuned_adapter = bool(
+        getattr(vae, "peft_config", None)
+        and "vae_finetune" in vae.peft_config
+    )
+
+    def reconstruct_initial_states():
+        reconstructed = []
+        with torch.inference_mode():
+            for pixels in initial_pixels.split(max(1, int(vae_batch_size))):
+                pixels = pixels.to(device=device, dtype=vae_dtype, non_blocking=True)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=vae_dtype,
+                    enabled=device.type == "cuda" and vae_dtype in {torch.float16, torch.bfloat16},
+                ):
+                    output = vae(pixels, sample_posterior=False).sample
+                normalized = 0.5 * (output.float().clamp(-1.0, 1.0).mean(dim=1) + 1.0)
+                physical = value_min + value_range * normalized
+                reconstructed.append(physical.mean(dim=1).cpu())
+        return torch.cat(reconstructed, dim=0)
+
+    if has_finetuned_adapter:
+        vae.disable_adapters()
+    base_initial_states = reconstruct_initial_states()
+    if has_finetuned_adapter:
+        vae.enable_adapters()
+        finetuned_initial_states = reconstruct_initial_states()
+    else:
+        print("No fine-tuned VAE adapter is loaded; both curves use the base VAE.")
+        finetuned_initial_states = base_initial_states.clone()
+    if vae_was_training:
+        vae.train()
+
+    all_initial_states = torch.cat(
+        [base_initial_states, finetuned_initial_states], dim=0
+    ).to(device=device, dtype=torch.float64)
+    trajectories = ks_integrate_cnab2_batch(
+        all_initial_states,
+        Lx=float(params.get("Lx", KS_DOMAIN_LENGTH)),
+        dt=dt,
+        Nt=(time_frames - 1) * steps_per_frame,
+        nsave=steps_per_frame,
+    )
+    normalized_trajectories = (trajectories - value_min) / value_range
+    base_trajectory, finetuned_trajectory = normalized_trajectories.chunk(2, dim=0)
+
+    def capped_mean_error(trajectory):
+        error = (trajectory - reference).abs().mean(dim=(0, 2))
+        return torch.nan_to_num(
+            error,
+            nan=float(error_cap),
+            posinf=float(error_cap),
+            neginf=float(error_cap),
+        ).clamp_max(float(error_cap)).float().cpu().numpy()
+
+    base_error = capped_mean_error(base_trajectory)
+    finetuned_error = capped_mean_error(finetuned_trajectory)
+    times = np.arange(time_frames, dtype=np.float32) * dt * steps_per_frame
+
+    fig, ax = plt.subplots(figsize=(8, 3.2))
+    ax.plot(times, base_error, color="tab:orange", linewidth=2.0, label="non-finetuned VAE")
+    ax.plot(times, finetuned_error, color="tab:green", linewidth=2.0, label="finetuned VAE")
+    ax.axhline(
+        float(error_cap),
+        color="tab:red",
+        linewidth=2.0,
+        label="random sampling error",
+    )
+    ax.set_title(f"KS VAE round-trip physical error over {len(chosen)} samples")
+    ax.set_xlabel("time")
+    ax.set_ylabel("mean absolute error [0,1]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
+
+    del trajectories, normalized_trajectories, reference, all_initial_states
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "times": times,
+        "base_error": base_error,
+        "finetuned_error": finetuned_error,
+    }
 
 
 def exponential_moving_average(values, alpha=0.08):

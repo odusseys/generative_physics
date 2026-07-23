@@ -3,7 +3,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.transformers.transformer_flux import FluxPosEmbed
+from diffusers.models.transformers.transformer_flux2 import apply_rotary_emb
 
 
 class ThermalCoefficientModulator(nn.Module):
@@ -78,15 +81,254 @@ class ThermalCoefficientModulator(nn.Module):
 
     def double_delta(self, block_index, conditioning_values, hidden_states):
         block = self.double_blocks[block_index]
-        values = self._conditioning_matrix(conditioning_values, hidden_states, block[0].weight.dtype)
+        values = self._conditioning_matrix(
+            conditioning_values,
+            hidden_states,
+            next(block.parameters()).dtype,
+        )
         return block(values).to(hidden_states.dtype).unsqueeze(1)
 
     def single_delta(self, block_index, conditioning_values, hidden_states):
         block = self.single_blocks[block_index]
-        values = self._conditioning_matrix(conditioning_values, hidden_states, block[0].weight.dtype)
+        values = self._conditioning_matrix(
+            conditioning_values,
+            hidden_states,
+            next(block.parameters()).dtype,
+        )
         mod6 = block(values).to(hidden_states.dtype)
         first, second = mod6.chunk(2, dim=-1)
         return (first + second).unsqueeze(1)
+
+
+class ConditionLatentAdaLNZero(nn.Module):
+    """Spatial AdaLN-Zero deltas from unpooled condition latent tokens."""
+
+    def __init__(self, condition_dim, transformer_dim, num_double_blocks, num_single_blocks):
+        super().__init__()
+        self.condition_dim = int(condition_dim)
+        self.transformer_dim = int(transformer_dim)
+        self.double_blocks = nn.ModuleList(
+            [self._make_adapter(6 * self.transformer_dim) for _ in range(num_double_blocks)]
+        )
+        self.single_blocks = nn.ModuleList(
+            [self._make_adapter(3 * self.transformer_dim) for _ in range(num_single_blocks)]
+        )
+
+    def _make_adapter(self, output_dim):
+        adapter = nn.Linear(self.condition_dim, output_dim)
+        nn.init.zeros_(adapter.weight)
+        nn.init.zeros_(adapter.bias)
+        return adapter
+
+    def _delta(self, blocks, block_index, condition_latents, hidden_states):
+        block = blocks[block_index]
+        if condition_latents.ndim != 3 or condition_latents.shape[-1] != self.condition_dim:
+            raise ValueError(
+                "condition_latents must have shape "
+                f"[batch, tokens, {self.condition_dim}]."
+            )
+        values = condition_latents.to(
+            device=hidden_states.device,
+            dtype=next(block.parameters()).dtype,
+        )
+        return block(values).to(hidden_states.dtype)
+
+    @staticmethod
+    def _validate_matching_tokens(delta, target_token_count):
+        target_token_count = int(target_token_count)
+        if delta.shape[1] != target_token_count:
+            raise ValueError(
+                "condition and target latent grids must match elementwise; "
+                f"got {delta.shape[1]} and {target_token_count} tokens."
+            )
+        return target_token_count
+
+    def double_delta(self, block_index, condition_latents, hidden_states, target_token_count):
+        delta = self._delta(
+            self.double_blocks,
+            block_index,
+            condition_latents,
+            hidden_states,
+        )
+        target_token_count = self._validate_matching_tokens(delta, target_token_count)
+        if target_token_count > hidden_states.shape[1]:
+            raise ValueError("target_token_count exceeds the image token count.")
+
+        output = hidden_states.new_zeros(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            delta.shape[-1],
+        )
+        output[:, :target_token_count] = delta
+        return output
+
+    def single_delta(
+        self,
+        block_index,
+        condition_latents,
+        hidden_states,
+        num_text_tokens,
+        target_token_count,
+    ):
+        delta = self._delta(
+            self.single_blocks,
+            block_index,
+            condition_latents,
+            hidden_states,
+        )
+        target_token_count = self._validate_matching_tokens(delta, target_token_count)
+        num_text_tokens = int(num_text_tokens)
+        if num_text_tokens + target_token_count > hidden_states.shape[1]:
+            raise ValueError("text and target token counts exceed the joint token count.")
+
+        output = hidden_states.new_zeros(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            delta.shape[-1],
+        )
+        target_slice = slice(num_text_tokens, num_text_tokens + target_token_count)
+        output[:, target_slice] = delta
+        return output
+
+
+class ConditionLatentCrossAttentionBlock(nn.Module):
+    def __init__(self, condition_dim, transformer_dim, attention_dim=512, num_heads=8):
+        super().__init__()
+        self.condition_dim = int(condition_dim)
+        self.transformer_dim = int(transformer_dim)
+        self.attention_dim = int(attention_dim)
+        self.num_heads = int(num_heads)
+        if self.attention_dim % self.num_heads != 0:
+            raise ValueError("attention_dim must be divisible by num_heads.")
+        self.head_dim = self.attention_dim // self.num_heads
+        self.to_q = nn.Linear(self.transformer_dim, self.attention_dim, bias=False)
+        self.to_k = nn.Linear(self.condition_dim, self.attention_dim, bias=False)
+        self.to_v = nn.Linear(self.condition_dim, self.attention_dim, bias=False)
+        self.to_out = nn.Linear(self.attention_dim, self.transformer_dim)
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+    def forward(
+        self,
+        image_hidden_states,
+        condition_latents,
+        image_rotary_emb=None,
+        condition_rotary_emb=None,
+    ):
+        if condition_latents.ndim != 3 or condition_latents.shape[-1] != self.condition_dim:
+            raise ValueError(
+                "condition_latents must have shape "
+                f"[batch, tokens, {self.condition_dim}]."
+            )
+        if condition_latents.shape[0] != image_hidden_states.shape[0]:
+            raise ValueError("condition and image token batches must match.")
+
+        projection_dtype = self.to_q.weight.dtype
+        queries = self.to_q(image_hidden_states.to(projection_dtype))
+        condition_latents = condition_latents.to(
+            device=image_hidden_states.device,
+            dtype=projection_dtype,
+        )
+        keys = self.to_k(condition_latents)
+        values = self.to_v(condition_latents)
+
+        def split_heads(tensor):
+            return tensor.reshape(
+                tensor.shape[0],
+                tensor.shape[1],
+                self.num_heads,
+                self.head_dim,
+            ).transpose(1, 2)
+
+        attention_dtype = image_hidden_states.dtype
+        queries = split_heads(queries).to(attention_dtype)
+        keys = split_heads(keys).to(attention_dtype)
+        values = split_heads(values).to(attention_dtype)
+        if image_rotary_emb is not None:
+            queries = apply_rotary_emb(queries, image_rotary_emb, sequence_dim=2)
+        if condition_rotary_emb is not None:
+            keys = apply_rotary_emb(keys, condition_rotary_emb, sequence_dim=2)
+        attended = F.scaled_dot_product_attention(queries, keys, values)
+        attended = attended.transpose(1, 2).reshape(
+            image_hidden_states.shape[0],
+            image_hidden_states.shape[1],
+            self.attention_dim,
+        )
+        return self.to_out(attended.to(self.to_out.weight.dtype)).to(image_hidden_states.dtype)
+
+
+class ConditionLatentCrossAttention(nn.Module):
+    """Block-end cross-attention residuals from an unpooled condition grid."""
+
+    def __init__(
+        self,
+        condition_dim,
+        transformer_dim,
+        num_double_blocks,
+        num_single_blocks,
+        attention_dim=512,
+        num_heads=8,
+        rope_theta=2000,
+        num_position_axes=4,
+    ):
+        super().__init__()
+        block_kwargs = {
+            "condition_dim": condition_dim,
+            "transformer_dim": transformer_dim,
+            "attention_dim": attention_dim,
+            "num_heads": num_heads,
+        }
+        self.double_blocks = nn.ModuleList(
+            [ConditionLatentCrossAttentionBlock(**block_kwargs) for _ in range(num_double_blocks)]
+        )
+        self.single_blocks = nn.ModuleList(
+            [ConditionLatentCrossAttentionBlock(**block_kwargs) for _ in range(num_single_blocks)]
+        )
+        head_dim = int(attention_dim) // int(num_heads)
+        if head_dim % int(num_position_axes) != 0:
+            raise ValueError("cross-attention head dimension must divide evenly across position axes.")
+        axis_dim = head_dim // int(num_position_axes)
+        if axis_dim % 2 != 0:
+            raise ValueError("each rotary position axis dimension must be even.")
+        self.axes_dims_rope = [axis_dim] * int(num_position_axes)
+        self.pos_embed = FluxPosEmbed(theta=int(rope_theta), axes_dim=self.axes_dims_rope)
+
+    def rotary_embeddings(self, image_ids, condition_token_count):
+        condition_token_count = int(condition_token_count)
+        if image_ids.shape[0] < condition_token_count:
+            raise ValueError("condition token count exceeds the image ID sequence length.")
+        condition_ids = image_ids[-condition_token_count:]
+        return self.pos_embed(image_ids), self.pos_embed(condition_ids)
+
+    def double_delta(
+        self,
+        block_index,
+        image_hidden_states,
+        condition_latents,
+        image_rotary_emb=None,
+        condition_rotary_emb=None,
+    ):
+        return self.double_blocks[block_index](
+            image_hidden_states,
+            condition_latents,
+            image_rotary_emb,
+            condition_rotary_emb,
+        )
+
+    def single_delta(
+        self,
+        block_index,
+        image_hidden_states,
+        condition_latents,
+        image_rotary_emb=None,
+        condition_rotary_emb=None,
+    ):
+        return self.single_blocks[block_index](
+            image_hidden_states,
+            condition_latents,
+            image_rotary_emb,
+            condition_rotary_emb,
+        )
 
 
 def attach_thermal_coefficient_modulation(transformer, bottleneck_dim=64, log_alpha_mean=0.0, log_alpha_std=1.0):
@@ -127,6 +369,38 @@ def attach_scalar_parameter_modulation(
     return transformer.thermal_modulation
 
 
+def attach_condition_latent_adaln_zero(transformer):
+    if hasattr(transformer, "condition_latent_adaln_zero"):
+        return transformer.condition_latent_adaln_zero
+
+    transformer.condition_latent_adaln_zero = ConditionLatentAdaLNZero(
+        condition_dim=transformer.config.in_channels,
+        transformer_dim=transformer.inner_dim,
+        num_double_blocks=len(transformer.transformer_blocks),
+        num_single_blocks=len(transformer.single_transformer_blocks),
+    )
+    transformer.forward = MethodType(_thermal_modulated_flux2_forward, transformer)
+    return transformer.condition_latent_adaln_zero
+
+
+def attach_condition_latent_cross_attention(transformer):
+    if hasattr(transformer, "condition_latent_cross_attention"):
+        return transformer.condition_latent_cross_attention
+
+    transformer.condition_latent_cross_attention = ConditionLatentCrossAttention(
+        condition_dim=transformer.config.in_channels,
+        transformer_dim=transformer.inner_dim,
+        attention_dim=512,
+        num_heads=8,
+        rope_theta=transformer.config.rope_theta,
+        num_position_axes=len(transformer.config.axes_dims_rope),
+        num_double_blocks=len(transformer.transformer_blocks),
+        num_single_blocks=len(transformer.single_transformer_blocks),
+    )
+    transformer.forward = MethodType(_thermal_modulated_flux2_forward, transformer)
+    return transformer.condition_latent_cross_attention
+
+
 def _thermal_modulated_flux2_forward(
     self,
     hidden_states: torch.Tensor,
@@ -139,6 +413,8 @@ def _thermal_modulated_flux2_forward(
     return_dict: bool = True,
     thermal_diffusivity: torch.Tensor | None = None,
     conditioning_values: torch.Tensor | None = None,
+    condition_latents: torch.Tensor | None = None,
+    target_token_count: int | None = None,
 ) -> torch.Tensor | Transformer2DModelOutput:
     num_txt_tokens = encoder_hidden_states.shape[1]
 
@@ -169,12 +445,42 @@ def _thermal_modulated_flux2_forward(
     if conditioning_values is None and thermal_diffusivity is not None:
         conditioning_values = thermal_diffusivity.reshape(-1, 1)
     has_thermal_modulation = conditioning_values is not None and hasattr(self, "thermal_modulation")
+    has_condition_latent_modulation = condition_latents is not None and hasattr(
+        self,
+        "condition_latent_adaln_zero",
+    )
+    has_condition_cross_attention = condition_latents is not None and hasattr(
+        self,
+        "condition_latent_cross_attention",
+    )
+    if has_condition_latent_modulation and has_condition_cross_attention:
+        raise RuntimeError("condition AdaLN-Zero and cross-attention modes are mutually exclusive.")
+    if has_condition_latent_modulation and target_token_count is None:
+        raise ValueError("target_token_count is required with condition_latents.")
+    cross_image_rotary_emb = None
+    cross_condition_rotary_emb = None
+    if has_condition_cross_attention:
+        cross_image_rotary_emb, cross_condition_rotary_emb = (
+            self.condition_latent_cross_attention.rotary_embeddings(
+                img_ids,
+                condition_latents.shape[1],
+            )
+        )
 
     for index_block, block in enumerate(self.transformer_blocks):
         block_mod_img = double_stream_mod_img
+        if has_thermal_modulation or has_condition_latent_modulation:
+            block_mod_img = double_stream_mod_img.unsqueeze(1)
         if has_thermal_modulation:
-            block_mod_img = double_stream_mod_img.unsqueeze(1) + self.thermal_modulation.double_delta(
+            block_mod_img = block_mod_img + self.thermal_modulation.double_delta(
                 index_block, conditioning_values, hidden_states
+            )
+        if has_condition_latent_modulation:
+            block_mod_img = block_mod_img + self.condition_latent_adaln_zero.double_delta(
+                index_block,
+                condition_latents,
+                hidden_states,
+                target_token_count,
             )
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -195,14 +501,32 @@ def _thermal_modulated_flux2_forward(
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+        if has_condition_cross_attention:
+            hidden_states = hidden_states + self.condition_latent_cross_attention.double_delta(
+                index_block,
+                hidden_states,
+                condition_latents,
+                cross_image_rotary_emb,
+                cross_condition_rotary_emb,
+            )
 
     hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
     for index_block, block in enumerate(self.single_transformer_blocks):
         block_mod = single_stream_mod
+        if has_thermal_modulation or has_condition_latent_modulation:
+            block_mod = single_stream_mod.unsqueeze(1)
         if has_thermal_modulation:
-            block_mod = single_stream_mod.unsqueeze(1) + self.thermal_modulation.single_delta(
+            block_mod = block_mod + self.thermal_modulation.single_delta(
                 index_block, conditioning_values, hidden_states
+            )
+        if has_condition_latent_modulation:
+            block_mod = block_mod + self.condition_latent_adaln_zero.single_delta(
+                index_block,
+                condition_latents,
+                hidden_states,
+                num_txt_tokens,
+                target_token_count,
             )
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             hidden_states = self._gradient_checkpointing_func(
@@ -221,6 +545,17 @@ def _thermal_modulated_flux2_forward(
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+        if has_condition_cross_attention:
+            text_hidden_states = hidden_states[:, :num_txt_tokens]
+            image_hidden_states = hidden_states[:, num_txt_tokens:]
+            image_hidden_states = image_hidden_states + self.condition_latent_cross_attention.single_delta(
+                index_block,
+                image_hidden_states,
+                condition_latents,
+                cross_image_rotary_emb,
+                cross_condition_rotary_emb,
+            )
+            hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
 
     hidden_states = hidden_states[:, num_txt_tokens:, ...]
     hidden_states = self.norm_out(hidden_states, temb)

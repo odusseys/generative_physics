@@ -23,6 +23,7 @@ KS_CMAP_NAME = "gray"
 KS_CONDITION_ENCODING = "y_constant"
 KS_REJECT_IF_CLIPPED = False
 KS_MAX_TRIES = 64
+KS_RANDOM_SAMPLING_MAE = 0.20495
 
 
 _KS_HILBERT_LUT_CACHE = {}
@@ -211,6 +212,61 @@ def ks_integrate_cnab2_torch(
             out_i += 1
 
     return U
+
+
+def ks_integrate_cnab2_batch(
+    initial_states,
+    Lx=KS_DOMAIN_LENGTH,
+    dt=KS_DT,
+    Nt=1020,
+    nsave=KS_STEPS_PER_FRAME,
+):
+    """Integrate a batch of KS states with the same CNAB2 discretization."""
+    initial_states = torch.as_tensor(initial_states)
+    if initial_states.ndim == 1:
+        initial_states = initial_states.unsqueeze(0)
+    if initial_states.ndim != 2:
+        raise ValueError("initial_states must have shape [batch, x].")
+    if Nt < 0 or nsave < 1 or Nt % nsave != 0:
+        raise ValueError("Nt must be nonnegative and divisible by positive nsave.")
+
+    initial_states = initial_states.to(torch.float64)
+    batch_size, nx = initial_states.shape
+    G, A_inv, B = ks_operators(Nx=nx, Lx=Lx, dt=dt, device=initial_states.device)
+    uhat = torch.fft.fft(initial_states, dim=-1)
+    uhat[..., 0] = 0.0
+    uhat[..., nx // 2] = 0.0
+
+    def nonlinear(current_uhat):
+        values = torch.fft.ifft(current_uhat, dim=-1).real
+        result = G * torch.fft.fft(values.square(), dim=-1)
+        result[..., 0] = 0.0
+        result[..., nx // 2] = 0.0
+        return result
+
+    nonlinear_previous = nonlinear(uhat)
+    nonlinear_current = nonlinear_previous.clone()
+    trajectory = torch.empty(
+        (batch_size, Nt // nsave + 1, nx),
+        device=initial_states.device,
+        dtype=torch.float64,
+    )
+    trajectory[:, 0] = torch.fft.ifft(uhat, dim=-1).real
+    output_index = 1
+    for step in range(1, Nt + 1):
+        uhat = A_inv * (
+            B * uhat
+            + 1.5 * dt * nonlinear_current
+            - 0.5 * dt * nonlinear_previous
+        )
+        uhat[..., 0] = 0.0
+        uhat[..., nx // 2] = 0.0
+        nonlinear_previous = nonlinear_current
+        nonlinear_current = nonlinear(uhat)
+        if step % nsave == 0:
+            trajectory[:, output_index] = torch.fft.ifft(uhat, dim=-1).real
+            output_index += 1
+    return trajectory
 
 
 def array_to_flame_pil(U, value_bounds=KS_VALUE_BOUNDS, cmap_name=KS_CMAP_NAME):
